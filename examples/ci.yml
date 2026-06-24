@@ -1,0 +1,66 @@
+# Example workflow for minact
+# Save this as .minact/workflows/ci.yml or minact.yml
+
+name: CI Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build"
+        required: false
+
+env:
+  APP_NAME: my-app
+  NODE_ENV: production
+
+jobs:
+  setup:
+    name: Setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Print info
+        run: |
+          echo "Running on ${{ runner.os }}"
+          echo "Workspace: ${{ github.workspace }}"
+          echo "App: ${{ env.APP_NAME }}"
+
+  build:
+    name: Build
+    needs: [setup]
+    steps:
+      - name: Install dependencies
+        run: echo "Installing dependencies..."
+      - name: Build project
+        run: echo "Building ${{ env.APP_NAME }}..."
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: ./dist
+
+  test:
+    name: Test
+    needs: [setup]
+    steps:
+      - name: Run tests
+        run: echo "Running tests..."
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./test-results
+
+  deploy:
+    name: Deploy
+    needs: [build, test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Deploy application
+        run: echo "Deploying ${{ env.APP_NAME }}..."
+      - name: Verify deployment
+        run: echo "Verifying deployment..."

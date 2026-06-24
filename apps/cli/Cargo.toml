@@ -1,0 +1,19 @@
+[package]
+name = "minact-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "minact"
+path = "src/main.rs"
+
+[dependencies]
+minact-core = { path = "../../crates/core" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
