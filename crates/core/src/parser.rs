@@ -31,36 +31,15 @@ impl WorkflowParser {
 
     /// Discover all workflow files in a project directory.
     ///
-    /// Search order:
-    /// 1. `.minact/workflows/*.yml` or `.minact/workflows/*.yaml`
-    /// 2. `.github/workflows/*.yml` or `.github/workflows/*.yaml` (GitHub Actions compat)
-    /// 3. `minact.yml` or `minact.yaml` at project root
+    /// Search path:
+    /// - `.fastforge/workflows/*.yml` or `.fastforge/workflows/*.yaml`
     pub fn discover_workflows(project_dir: &Path) -> Result<Vec<Workflow>, WorkflowError> {
         let mut workflows = Vec::new();
 
-        // Search in .minact/workflows/
-        let minact_workflows = project_dir.join(".minact").join("workflows");
-        if minact_workflows.exists() {
-            workflows.extend(Self::find_yaml_files(&minact_workflows)?);
-        }
-
-        // Search in .github/workflows/ (GitHub Actions compatibility)
-        let github_workflows = project_dir.join(".github").join("workflows");
-        if github_workflows.exists() {
-            workflows.extend(Self::find_yaml_files(&github_workflows)?);
-        }
-
-        // Search for root-level minact.yml or minact.yaml
-        for filename in &["minact.yml", "minact.yaml"] {
-            let root_file = project_dir.join(filename);
-            if root_file.exists() {
-                match Self::parse_file(&root_file) {
-                    Ok(wf) => workflows.push(wf),
-                    Err(e) => {
-                        tracing::warn!("Failed to parse {}: {}", root_file.display(), e);
-                    }
-                }
-            }
+        // Search in .fastforge/workflows/
+        let fastforge_workflows = project_dir.join(".fastforge").join("workflows");
+        if fastforge_workflows.exists() {
+            workflows.extend(Self::find_yaml_files(&fastforge_workflows)?);
         }
 
         Ok(workflows)
