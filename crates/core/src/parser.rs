@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::workflow::*;
 use crate::types::WorkflowError;
+use crate::workflow::*;
 
 /// Discover and parse workflow files from a project.
 pub struct WorkflowParser;
@@ -23,8 +23,7 @@ impl WorkflowParser {
 
     /// Parse a workflow from a YAML file path.
     pub fn parse_file(path: &Path) -> Result<Workflow, WorkflowError> {
-        let yaml = std::fs::read_to_string(path)
-            .map_err(|e| WorkflowError::IoError(e))?;
+        let yaml = std::fs::read_to_string(path).map_err(|e| WorkflowError::IoError(e))?;
         let file_path = Some(path.to_path_buf());
         Self::parse_yaml(&yaml, file_path)
     }
@@ -32,9 +31,31 @@ impl WorkflowParser {
     /// Discover all workflow files in a project directory.
     ///
     /// Search path:
+    /// - `.minact/workflows/*.yml` or `.minact/workflows/*.yaml`
+    /// - `.github/workflows/*.yml` or `.github/workflows/*.yaml`
+    /// - `minact.yml` or `minact.yaml`
     /// - `.fastforge/workflows/*.yml` or `.fastforge/workflows/*.yaml`
     pub fn discover_workflows(project_dir: &Path) -> Result<Vec<Workflow>, WorkflowError> {
         let mut workflows = Vec::new();
+
+        // Search in .minact/workflows/
+        let minact_workflows = project_dir.join(".minact").join("workflows");
+        if minact_workflows.exists() {
+            workflows.extend(Self::find_yaml_files(&minact_workflows)?);
+        }
+
+        // Search in .github/workflows/
+        let github_workflows = project_dir.join(".github").join("workflows");
+        if github_workflows.exists() {
+            workflows.extend(Self::find_yaml_files(&github_workflows)?);
+        }
+
+        for file_name in &["minact.yml", "minact.yaml"] {
+            let path = project_dir.join(file_name);
+            if path.exists() {
+                workflows.push(Self::parse_file(&path)?);
+            }
+        }
 
         // Search in .fastforge/workflows/
         let fastforge_workflows = project_dir.join(".fastforge").join("workflows");
@@ -71,14 +92,15 @@ impl WorkflowParser {
     fn validate(workflow: &Workflow) -> Result<(), WorkflowError> {
         if workflow.jobs.is_empty() {
             return Err(WorkflowError::ParseError(
-                "Workflow must have at least one job".to_string()
+                "Workflow must have at least one job".to_string(),
             ));
         }
 
         for (job_id, job) in &workflow.jobs {
             if job.steps.is_empty() {
                 return Err(WorkflowError::ParseError(format!(
-                    "Job '{}' must have at least one step", job_id
+                    "Job '{}' must have at least one step",
+                    job_id
                 )));
             }
 
@@ -87,7 +109,8 @@ impl WorkflowParser {
                 if step.uses.is_none() && step.run.is_none() {
                     return Err(WorkflowError::ParseError(format!(
                         "Step {} in job '{}' must have either 'uses' or 'run'",
-                        step_idx + 1, job_id
+                        step_idx + 1,
+                        job_id
                     )));
                 }
 
@@ -95,7 +118,8 @@ impl WorkflowParser {
                 if step.uses.is_some() && step.run.is_some() {
                     return Err(WorkflowError::ParseError(format!(
                         "Step {} in job '{}' cannot have both 'uses' and 'run'",
-                        step_idx + 1, job_id
+                        step_idx + 1,
+                        job_id
                     )));
                 }
             }
@@ -184,7 +208,10 @@ jobs:
         assert!(workflow.on.workflow_dispatch.is_some());
         let dispatch = workflow.on.workflow_dispatch.as_ref().unwrap();
         assert!(dispatch.inputs.is_some());
-        assert_eq!(dispatch.inputs.as_ref().unwrap()["version"].description, "Version to release");
+        assert_eq!(
+            dispatch.inputs.as_ref().unwrap()["version"].description,
+            "Version to release"
+        );
         assert!(dispatch.inputs.as_ref().unwrap()["version"].required);
         assert_eq!(workflow.jobs.len(), 2);
         assert!(workflow.jobs["publish"].if_condition.is_some());

@@ -5,9 +5,16 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
 
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
+
+use crate::logging::{CommandStream, LogEvent, LogLevel, Reporter, TracingReporter};
+use crate::types::{
+    Context, GithubContext, RunnerContext, StepConclusion, StepResult, WorkflowError,
+};
 use crate::workflow::*;
-use crate::types::{Context, GithubContext, RunnerContext, StepConclusion, StepResult, WorkflowError};
 
 use crate::actions::{ActionContext, ActionRegistry};
 use crate::expr;
@@ -19,7 +26,8 @@ pub struct Engine {
     actions: ActionRegistry,
     /// Current workspace directory.
     workspace: PathBuf,
-
+    /// Receives structured execution log events.
+    reporter: Arc<dyn Reporter>,
 }
 
 impl Engine {
@@ -28,6 +36,7 @@ impl Engine {
         Self {
             actions: ActionRegistry::new(),
             workspace,
+            reporter: Arc::new(TracingReporter),
         }
     }
 
@@ -36,6 +45,29 @@ impl Engine {
         Self {
             actions,
             workspace,
+            reporter: Arc::new(TracingReporter),
+        }
+    }
+
+    /// Create a new engine with a custom reporter.
+    pub fn with_reporter(workspace: PathBuf, reporter: Arc<dyn Reporter>) -> Self {
+        Self {
+            actions: ActionRegistry::new(),
+            workspace,
+            reporter,
+        }
+    }
+
+    /// Create a new engine with a custom action registry and reporter.
+    pub fn with_actions_and_reporter(
+        workspace: PathBuf,
+        actions: ActionRegistry,
+        reporter: Arc<dyn Reporter>,
+    ) -> Self {
+        Self {
+            actions,
+            workspace,
+            reporter,
         }
     }
 
@@ -51,8 +83,11 @@ impl Engine {
         event_name: &str,
         inputs: HashMap<String, String>,
     ) -> Result<EngineResult, WorkflowError> {
-        tracing::info!("Starting workflow: {}", workflow.name);
-        tracing::info!("Event: {}", event_name);
+        self.emit(LogEvent::WorkflowStarted {
+            workflow_name: workflow.name.clone(),
+            event_name: event_name.to_string(),
+        })
+        .await;
 
         // Build the execution context
         let ctx = self.build_context(workflow, event_name, inputs);
@@ -61,10 +96,10 @@ impl Engine {
         let scheduler = JobScheduler::new(workflow);
         let layers = scheduler.resolve_parallel_layers()?;
 
-        tracing::info!("Execution plan: {} layers", layers.len());
-        for (i, layer) in layers.iter().enumerate() {
-            tracing::info!("  Layer {}: {} jobs", i, layer.len());
-        }
+        self.emit(LogEvent::ExecutionPlan {
+            layers: layers.clone(),
+        })
+        .await;
 
         let mut all_results: HashMap<String, JobResult> = HashMap::new();
         let mut ctx = ctx;
@@ -74,7 +109,9 @@ impl Engine {
             // Execute jobs within each layer sequentially
             // (parallel execution across layers is handled by layer ordering)
             for job_id in layer {
-                let result = self.execute_job(job_id, workflow, &scheduler, &mut ctx).await?;
+                let result = self
+                    .execute_job(job_id, workflow, &scheduler, &mut ctx)
+                    .await?;
                 all_results.insert(job_id.clone(), result);
             }
         }
@@ -97,14 +134,22 @@ impl Engine {
         ctx: &mut Context,
     ) -> Result<JobResult, WorkflowError> {
         let job = &workflow.jobs[job_id];
-        tracing::info!("");
-        tracing::info!("═══ Job: {} ({}) ═══", job.name, job_id);
+        self.emit(LogEvent::JobStarted {
+            job_id: job_id.to_string(),
+            job_name: job.name.clone(),
+        })
+        .await;
 
         // Check if condition
         if let Some(if_expr) = &job.if_condition {
             let should_run = evaluate_if_condition(if_expr, ctx)?;
             if !should_run {
-                tracing::info!("  → Skipped (condition: {})", if_expr);
+                self.emit(LogEvent::JobSkipped {
+                    job_id: job_id.to_string(),
+                    job_name: job.name.clone(),
+                    condition: if_expr.clone(),
+                })
+                .await;
                 return Ok(JobResult {
                     job_id: job_id.to_string(),
                     job_name: job.name.clone(),
@@ -133,13 +178,21 @@ impl Engine {
 
             // Record step outputs in context
             if let Some(ref step_id) = step.id {
-                ctx.step_outputs.insert(step_id.clone(), step_result.outputs.clone());
+                ctx.step_outputs
+                    .insert(step_id.clone(), step_result.outputs.clone());
             }
 
             // Handle continue-on-error
             if !step_success {
                 if step.continue_on_error.unwrap_or(false) {
-                    tracing::warn!("  → Step '{}' failed but continue-on-error is set", step.name);
+                    self.emit(LogEvent::Message {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "Step '{}' failed but continue-on-error is set",
+                            step.name
+                        ),
+                    })
+                    .await;
                 } else {
                     job_success = false;
                     job_conclusion = StepConclusion::Failure;
@@ -154,20 +207,22 @@ impl Engine {
         // Collect job outputs
         if let Some(outputs_config) = &job.outputs {
             for (output_name, expr) in outputs_config {
-                let value = expr::evaluate_string(expr, ctx)
-                    .unwrap_or_else(|_| expr.clone());
+                let value = expr::evaluate_string(expr, ctx).unwrap_or_else(|_| expr.clone());
                 job_outputs.insert(output_name.clone(), value);
             }
         }
 
         // Store job outputs in context for dependent jobs
-        ctx.job_outputs.insert(job_id.to_string(), job_outputs.clone());
+        ctx.job_outputs
+            .insert(job_id.to_string(), job_outputs.clone());
 
-        if job_success {
-            tracing::info!("✓ Job '{}' completed successfully", job.name);
-        } else {
-            tracing::error!("✗ Job '{}' failed", job.name);
-        }
+        self.emit(LogEvent::JobFinished {
+            job_id: job_id.to_string(),
+            job_name: job.name.clone(),
+            success: job_success,
+            conclusion: job_conclusion.clone(),
+        })
+        .await;
 
         Ok(JobResult {
             job_id: job_id.to_string(),
@@ -184,7 +239,7 @@ impl Engine {
         &self,
         step: &Step,
         step_idx: usize,
-        _job_id: &str,
+        job_id: &str,
         ctx: &Context,
     ) -> Result<StepResult, WorkflowError> {
         let step_name = if step.name.is_empty() {
@@ -193,14 +248,24 @@ impl Engine {
             step.name.clone()
         };
 
-        tracing::info!("");
-        tracing::info!("  ── Step {}: {} ──", step_idx + 1, step_name);
+        self.emit(LogEvent::StepStarted {
+            job_id: job_id.to_string(),
+            step_index: step_idx,
+            step_name: step_name.clone(),
+        })
+        .await;
 
         // Check step-level condition
         if let Some(if_expr) = &step.if_condition {
             let should_run = evaluate_if_condition(if_expr, ctx)?;
             if !should_run {
-                tracing::info!("    → Skipped (condition: {})", if_expr);
+                self.emit(LogEvent::StepSkipped {
+                    job_id: job_id.to_string(),
+                    step_index: step_idx,
+                    step_name: step_name.clone(),
+                    condition: if_expr.clone(),
+                })
+                .await;
                 return Ok(StepResult {
                     success: true,
                     conclusion: StepConclusion::Skipped,
@@ -218,7 +283,8 @@ impl Engine {
             self.execute_shell_step(step, run, step_name, ctx).await
         } else {
             Err(WorkflowError::Other(format!(
-                "Step '{}' has no 'uses' or 'run'", step_name
+                "Step '{}' has no 'uses' or 'run'",
+                step_name
             )))
         }
     }
@@ -234,17 +300,25 @@ impl Engine {
         // Parse action reference: "actions/checkout@v4" → "actions/checkout"
         let action_name = uses.split('@').next().unwrap_or(uses);
 
-        let action = self.actions.get(action_name)
+        let action = self
+            .actions
+            .get(action_name)
             .ok_or_else(|| WorkflowError::ActionNotFound(action_name.to_string()))?;
 
-        tracing::info!("    Using: {}", uses);
+        self.emit(LogEvent::ActionStarted {
+            uses: uses.to_string(),
+        })
+        .await;
 
         // Resolve with: parameters through expression evaluation
         let mut resolved_inputs = HashMap::new();
         for (k, v) in &step.with {
-            let resolved = expr::evaluate_string(v, ctx)
-                .unwrap_or_else(|_| v.clone());
-            tracing::info!("    with: {} = {}", k, resolved);
+            let resolved = expr::evaluate_string(v, ctx).unwrap_or_else(|_| v.clone());
+            self.emit(LogEvent::ActionInput {
+                name: k.clone(),
+                value: resolved.clone(),
+            })
+            .await;
             resolved_inputs.insert(k.clone(), resolved);
         }
 
@@ -254,15 +328,13 @@ impl Engine {
             step_env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        let working_dir = step.working_directory
-            .as_ref()
-            .map(|wd| {
-                if Path::new(wd).is_absolute() {
-                    PathBuf::from(wd)
-                } else {
-                    self.workspace.join(wd)
-                }
-            });
+        let working_dir = step.working_directory.as_ref().map(|wd| {
+            if Path::new(wd).is_absolute() {
+                PathBuf::from(wd)
+            } else {
+                self.workspace.join(wd)
+            }
+        });
 
         let action_ctx = ActionContext {
             inputs: resolved_inputs,
@@ -274,17 +346,18 @@ impl Engine {
         };
 
         // Validate action inputs
-        action.validate(&action_ctx)
+        action
+            .validate(&action_ctx)
             .map_err(|e| WorkflowError::StepFailed(step_name.clone(), e.to_string()))?;
 
         // Run the action
         match action.run(&action_ctx).await {
             Ok(output) => {
-                if output.success {
-                    tracing::info!("    ✓ Action completed successfully");
-                } else {
-                    tracing::error!("    ✗ Action failed");
-                }
+                self.emit(LogEvent::ActionFinished {
+                    success: output.success,
+                    conclusion: output.conclusion.clone(),
+                })
+                .await;
                 Ok(StepResult {
                     success: output.success,
                     conclusion: output.conclusion,
@@ -293,7 +366,10 @@ impl Engine {
                 })
             }
             Err(e) => {
-                tracing::error!("    ✗ Action error: {}", e);
+                self.emit(LogEvent::ActionError {
+                    message: e.to_string(),
+                })
+                .await;
                 Ok(StepResult {
                     success: false,
                     conclusion: StepConclusion::Failure,
@@ -313,12 +389,9 @@ impl Engine {
         ctx: &Context,
     ) -> Result<StepResult, WorkflowError> {
         // Resolve expressions in the run command
-        let resolved_run = expr::evaluate_string(run, ctx)
-            .unwrap_or_else(|_| run.to_string());
+        let resolved_run = expr::evaluate_string(run, ctx).unwrap_or_else(|_| run.to_string());
 
         let shell = step.shell.as_deref().unwrap_or("bash");
-        tracing::info!("    Run: {}", resolved_run);
-        tracing::info!("    Shell: {}", shell);
 
         // Build the command
         let (shell_cmd, shell_arg) = match shell {
@@ -329,7 +402,8 @@ impl Engine {
             other => (other, None),
         };
 
-        let working_dir = step.working_directory
+        let working_dir = step
+            .working_directory
             .as_ref()
             .map(|wd| {
                 if Path::new(wd).is_absolute() {
@@ -340,6 +414,13 @@ impl Engine {
             })
             .unwrap_or_else(|| self.workspace.clone());
 
+        self.emit(LogEvent::CommandStarted {
+            command: resolved_run.clone(),
+            shell: shell.to_string(),
+            working_dir: working_dir.display().to_string(),
+        })
+        .await;
+
         // Execute the command
         let mut cmd = tokio::process::Command::new(shell_cmd);
         if let Some(arg) = shell_arg {
@@ -347,6 +428,8 @@ impl Engine {
         }
         cmd.arg(&resolved_run);
         cmd.current_dir(&working_dir);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         // Set environment variables
         cmd.env_clear();
@@ -359,35 +442,67 @@ impl Engine {
             cmd.env(k, v);
         }
 
-        // Execute and capture output
-        let output = cmd.output().await.map_err(|e| {
-            WorkflowError::StepFailed(step_name.clone(), format!("Failed to execute command: {}", e))
+        // Execute and stream output.
+        let mut child = cmd.spawn().map_err(|e| {
+            WorkflowError::StepFailed(
+                step_name.clone(),
+                format!("Failed to execute command: {}", e),
+            )
         })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = child.stdout.take().ok_or_else(|| {
+            WorkflowError::StepFailed(step_name.clone(), "Failed to capture stdout".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            WorkflowError::StepFailed(step_name.clone(), "Failed to capture stderr".to_string())
+        })?;
 
-        if !stdout.is_empty() {
-            for line in stdout.lines() {
-                tracing::info!("    │ {}", line);
-            }
-        }
-        if !stderr.is_empty() {
-            for line in stderr.lines() {
-                tracing::warn!("    │ {}", line);
-            }
-        }
+        let stdout_reporter = Arc::clone(&self.reporter);
+        let stderr_reporter = Arc::clone(&self.reporter);
+        let stdout_task = tokio::spawn(async move {
+            emit_command_output(
+                BufReader::new(stdout),
+                CommandStream::Stdout,
+                stdout_reporter,
+            )
+            .await
+        });
+        let stderr_task = tokio::spawn(async move {
+            emit_command_output(
+                BufReader::new(stderr),
+                CommandStream::Stderr,
+                stderr_reporter,
+            )
+            .await
+        });
 
-        let success = output.status.success();
-        if success {
-            tracing::info!("    ✓ Command completed with status: {}", output.status);
-        } else {
-            tracing::error!("    ✗ Command failed with status: {}", output.status);
-        }
+        let status = child.wait().await.map_err(|e| {
+            WorkflowError::StepFailed(
+                step_name.clone(),
+                format!("Failed to wait for command: {}", e),
+            )
+        })?;
+        stdout_task.await.map_err(|e| {
+            WorkflowError::StepFailed(step_name.clone(), format!("Failed to read stdout: {}", e))
+        })??;
+        stderr_task.await.map_err(|e| {
+            WorkflowError::StepFailed(step_name.clone(), format!("Failed to read stderr: {}", e))
+        })??;
+
+        let success = status.success();
+        self.emit(LogEvent::CommandFinished {
+            success,
+            status: status.to_string(),
+        })
+        .await;
 
         Ok(StepResult {
             success,
-            conclusion: if success { StepConclusion::Success } else { StepConclusion::Failure },
+            conclusion: if success {
+                StepConclusion::Success
+            } else {
+                StepConclusion::Failure
+            },
             outputs: HashMap::new(),
             artifacts: Vec::new(),
         })
@@ -410,8 +525,10 @@ impl Engine {
             github: GithubContext {
                 event_name: event_name.to_string(),
                 event: HashMap::new(),
-                repository: std::env::var("GITHUB_REPOSITORY").unwrap_or_else(|_| "local/repo".to_string()),
-                ref_name: std::env::var("GITHUB_REF").unwrap_or_else(|_| "refs/heads/main".to_string()),
+                repository: std::env::var("GITHUB_REPOSITORY")
+                    .unwrap_or_else(|_| "local/repo".to_string()),
+                ref_name: std::env::var("GITHUB_REF")
+                    .unwrap_or_else(|_| "refs/heads/main".to_string()),
                 sha: std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".to_string()),
                 workspace: self.workspace.to_string_lossy().to_string(),
                 action: String::new(),
@@ -430,6 +547,27 @@ impl Engine {
             },
         }
     }
+
+    async fn emit(&self, event: LogEvent) {
+        self.reporter.emit(event).await;
+    }
+}
+
+async fn emit_command_output<R>(
+    reader: R,
+    stream: CommandStream,
+    reporter: Arc<dyn Reporter>,
+) -> Result<(), WorkflowError>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+{
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        reporter
+            .emit(LogEvent::CommandOutput { stream, line })
+            .await;
+    }
+    Ok(())
 }
 
 /// Evaluate a job/step `if` condition.
@@ -473,8 +611,29 @@ pub struct JobResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::{CommandStream, LogEvent, Reporter};
     use crate::parser::WorkflowParser;
+    use async_trait::async_trait;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CollectingReporter {
+        events: Mutex<Vec<LogEvent>>,
+    }
+
+    #[async_trait]
+    impl Reporter for CollectingReporter {
+        async fn emit(&self, event: LogEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    impl CollectingReporter {
+        fn events(&self) -> Vec<LogEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
 
     #[tokio::test]
     async fn test_basic_workflow_execution() {
@@ -491,7 +650,10 @@ jobs:
 
         let workflow = WorkflowParser::parse_yaml(yaml, None).unwrap();
         let engine = Engine::new(PathBuf::from("/tmp"));
-        let result = engine.run_workflow(&workflow, "workflow_dispatch", HashMap::new()).await.unwrap();
+        let result = engine
+            .run_workflow(&workflow, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
 
         assert_eq!(result.workflow_name, "Test");
         assert!(result.success);
@@ -521,10 +683,94 @@ jobs:
 
         let workflow = WorkflowParser::parse_yaml(yaml, None).unwrap();
         let engine = Engine::new(PathBuf::from("/tmp"));
-        let result = engine.run_workflow(&workflow, "workflow_dispatch", HashMap::new()).await.unwrap();
+        let result = engine
+            .run_workflow(&workflow, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
 
         assert!(result.success);
-        assert_eq!(result.job_results["skip-me"].conclusion, StepConclusion::Skipped);
-        assert_eq!(result.job_results["run-me"].conclusion, StepConclusion::Success);
+        assert_eq!(
+            result.job_results["skip-me"].conclusion,
+            StepConclusion::Skipped
+        );
+        assert_eq!(
+            result.job_results["run-me"].conclusion,
+            StepConclusion::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reporter_emits_command_stdout_and_stderr() {
+        let yaml = r#"
+name: Logs
+on: workflow_dispatch
+jobs:
+  logs:
+    name: Logs
+    steps:
+      - name: Emit streams
+        run: printf 'out\n'; printf 'err\n' >&2
+"#;
+
+        let workflow = WorkflowParser::parse_yaml(yaml, None).unwrap();
+        let reporter = Arc::new(CollectingReporter::default());
+        let engine = Engine::with_reporter(PathBuf::from("/tmp"), reporter.clone());
+        let result = engine
+            .run_workflow(&workflow, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let events = reporter.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LogEvent::CommandStarted { command, shell, .. }
+                if command.contains("printf 'out") && shell == "bash"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LogEvent::CommandOutput { stream: CommandStream::Stdout, line } if line == "out"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LogEvent::CommandOutput { stream: CommandStream::Stderr, line } if line == "err"
+        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, LogEvent::CommandFinished { success: true, .. })));
+    }
+
+    #[tokio::test]
+    async fn test_reporter_emits_skipped_step_without_command() {
+        let yaml = r#"
+name: Skip
+on: workflow_dispatch
+jobs:
+  skip:
+    name: Skip
+    steps:
+      - name: No command
+        if: false
+        run: echo "nope"
+"#;
+
+        let workflow = WorkflowParser::parse_yaml(yaml, None).unwrap();
+        let reporter = Arc::new(CollectingReporter::default());
+        let engine = Engine::with_reporter(PathBuf::from("/tmp"), reporter.clone());
+        let result = engine
+            .run_workflow(&workflow, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let events = reporter.events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LogEvent::StepSkipped { step_name, condition, .. }
+                if step_name == "No command" && condition == "false"
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, LogEvent::CommandStarted { .. })));
     }
 }

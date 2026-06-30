@@ -1,44 +1,91 @@
-# minact — Run GitHub Actions workflows locally
+# minact
 
-minact is a lightweight tool that runs GitHub Actions-compatible workflows on your local machine. It parses standard YAML workflow files and executes jobs and steps in dependency order, right on your local environment.
+> A lightweight GitHub Actions-compatible workflow runner
+
+minact is a lightweight tool that runs GitHub Actions-compatible workflows on your local machine. It parses standard YAML workflow files and executes jobs and steps in dependency order — no Docker daemon, no hosted runners, just your local environment.
 
 ## Features
 
-- **GitHub Actions compatible** — Directly uses `.yml`/`.yaml` format with `on`/`jobs`/`steps`/`needs`/`if` syntax
-- **Expression evaluation** — Supports `${{ github.ref }}`, `${{ env.FOO }}`, `${{ secrets.KEY }}`, and functions like `contains()`, `startsWith()`
-- **Conditional execution** — `if: github.event_name == 'push'` to skip jobs/steps
-- **Built-in Actions** — `actions/checkout`, `actions/cache`, `actions/upload-artifact`, `actions/download-artifact`
-- **Shell steps** — Run shell commands via `run:` with `bash`/`sh`/`python`/`node` support
-- **Job dependencies** — DAG resolution via `needs:`, executed in topological order
-- **Workflow discovery** — Auto-search in `.minact/workflows/`, `.github/workflows/`, `minact.yml`
+- **Drop-in compatible** — Use your existing `.yml`/`.yaml` workflow files as-is
+- **Expression evaluation** — Full support for `${{ github.* }}`, `${{ env.* }}`, `${{ secrets.* }}`, `${{ inputs.* }}`, `${{ needs.* }}`, and functions like `contains()`, `startsWith()`, `success()`, `failure()`
+- **Conditional execution** — Skip jobs and steps with `if:` conditions
+- **Built-in Actions** — Ships with `actions/checkout`, `actions/cache`, `actions/upload-artifact`, `actions/download-artifact`
+- **Shell flexibility** — Run steps with `bash`, `sh`, `python`, or `node`
+- **DAG scheduler** — Resolves job dependencies (`needs:`) and executes them in topological order
+- **Auto-discovery** — Finds workflows in `.minact/workflows/`, `.github/workflows/`, or the project root
+- **Event simulation** — Trigger workflows as `push`, `pull_request`, `workflow_dispatch`, or any event you specify
+
+## Supported Syntax
+
+| Category | Syntax | Status |
+|----------|--------|--------|
+| Events | `on: push` / `on: [push, pull_request]` / `on: { push: { branches: [main] } }` | ✅ |
+| Environment | `env:` at workflow / job / step level | ✅ |
+| Job deps | `jobs.<job_id>.needs` | ✅ |
+| Conditions | `jobs.<job_id>.if` / `steps[].if` | ✅ |
+| Outputs | `jobs.<job_id>.outputs` | ✅ |
+| Steps | `steps[].uses`, `steps[].run`, `steps[].with` | ✅ |
+| Step options | `continue-on-error`, `shell`, `working-directory` | ✅ |
+| Contexts | `${{ github.* }}`, `${{ env.* }}`, `${{ secrets.* }}` | ✅ |
+| More contexts | `${{ runner.* }}`, `${{ inputs.* }}`, `${{ needs.* }}` | ✅ |
+| Functions | `contains()`, `startsWith()`, `endsWith()` | ✅ |
+| Status checks | `success()`, `failure()`, `always()` | ✅ |
+| Matrix strategy | `strategy.matrix` | 📋 Planned |
+| Runner selection | `runs-on` | 📋 Planned |
+
+## Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) 1.75+ (for building from source)
+- Git (for `actions/checkout`)
 
 ## Installation
 
 ```bash
-# Build from source
 cargo build --release
 ./target/release/minact --help
 ```
 
 ## Quick Start
 
-Create a workflow file `.minact/workflows/ci.yml`:
+Create a workflow file at `.minact/workflows/ci.yml`:
 
 ```yaml
-name: CI
-on: [push, pull_request]
+name: CI Pipeline
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build"
+        required: false
 
 env:
-  APP: my-app
+  APP_NAME: my-app
+  NODE_ENV: production
 
 jobs:
+  setup:
+    name: Setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Print info
+        run: |
+          echo "Running on ${{ runner.os }}"
+          echo "Workspace: ${{ github.workspace }}"
+          echo "App: ${{ env.APP_NAME }}"
+
   build:
     name: Build
+    needs: [setup]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Build
-        run: echo "Building ${{ env.APP }}..."
+      - name: Install dependencies
+        run: echo "Installing dependencies..."
+      - name: Build project
+        run: echo "Building ${{ env.APP_NAME }}..."
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -47,21 +94,30 @@ jobs:
 
   test:
     name: Test
-    needs: [build]
+    needs: [setup]
     steps:
       - name: Run tests
         run: echo "Running tests..."
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./test-results
 
   deploy:
     name: Deploy
-    needs: [test]
-    if: github.event_name == 'push'
+    needs: [build, test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Deploy
-        run: echo "Deploying..."
+      - name: Deploy application
+        run: echo "Deploying ${{ env.APP_NAME }}..."
+      - name: Verify deployment
+        run: echo "Verifying deployment..."
 ```
 
-Run:
+Run it:
+
+**Using the compiled binary:**
 
 ```bash
 # Auto-discover and run
@@ -75,6 +131,23 @@ minact run --event push
 
 # Pass input parameters
 minact run --input version=1.0.0
+
+# Emit structured JSON log events
+minact run --log-format json
+
+# Use compact fixed-prefix logs
+minact run --log-format plain
+```
+
+**Using cargo:**
+
+```bash
+cargo run -- run
+cargo run -- run --file examples/ci.yml
+cargo run -- run --event push
+cargo run -- run --input version=1.0.0
+cargo run -- run --log-format json
+cargo run -- run --log-format plain
 ```
 
 ## Commands
@@ -85,7 +158,7 @@ minact run --input version=1.0.0
 | `minact list` | List workflows in the project |
 | `minact validate <file>` | Validate a workflow file |
 
-### minact run
+### `minact run`
 
 ```
 Usage: minact run [OPTIONS]
@@ -95,9 +168,10 @@ Options:
   -e, --event <EVENT>      Event type to simulate [default: workflow_dispatch]
   -w, --workspace <DIR>    Working directory [default: current directory]
   -i, --input <KEY=VALUE>  Input parameters (can be specified multiple times)
+      --log-format <FMT>   Log output format: pretty, plain, or json [default: pretty]
 ```
 
-### minact list
+### `minact list`
 
 ```
 Usage: minact list [OPTIONS]
@@ -107,30 +181,41 @@ Options:
   -v, --verbose     Show detailed information
 ```
 
+### `minact validate`
+
+```
+Usage: minact validate <FILE>
+
+Arguments:
+  <FILE>  Path to the workflow file to validate
+```
+
 ## Workflow File Discovery
 
-Auto-discovery searches in the following order:
+minact searches for workflow files in the following order:
 
 1. `.minact/workflows/*.yml` / `.minact/workflows/*.yaml`
-2. `.github/workflows/*.yml` / `.github/workflows/*.yaml` (GitHub Actions compatible)
-3. `minact.yml` / `minact.yaml` (project root)
+2. `.github/workflows/*.yml` / `.github/workflows/*.yaml` — compatible with GitHub Actions layout
+3. `minact.yml` / `minact.yaml` — project root
+
+The first match wins.
 
 ## Project Structure
 
 ```
 minact/
-├── Cargo.toml              # Workspace config
+├── Cargo.toml              # Workspace manifest
 ├── crates/
 │   └── core/               # Core engine library
 │       └── src/
 │           ├── lib.rs
 │           ├── types.rs    # Context, Value, StepResult, etc.
-│           ├── workflow.rs  # Workflow/Job/Step/YAML models
-│           ├── expr.rs     # Expression parser + evaluator
+│           ├── workflow.rs # Workflow / Job / Step models
+│           ├── expr.rs     # Expression parser & evaluator
 │           ├── parser.rs   # Workflow YAML parser
-│           ├── scheduler.rs # Job DAG scheduler
+│           ├── scheduler.rs# Job DAG scheduler
 │           ├── engine.rs   # Execution engine
-│           └── actions/    # Built-in actions
+│           └── actions/    # Built-in GitHub Actions
 │               └── mod.rs
 ├── apps/
 │   └── cli/                # CLI binary
@@ -140,28 +225,9 @@ minact/
     └── ci.yml              # Example workflow
 ```
 
-## Supported Syntax
+## Contributing
 
-| Syntax | Status |
-|--------|--------|
-| `on: push` / `on: [push, pull_request]` / `on: { push: { branches: [main] } }` | ✅ |
-| `env:` | ✅ |
-| `jobs.<job_id>.needs` | ✅ |
-| `jobs.<job_id>.if` | ✅ |
-| `jobs.<job_id>.outputs` | ✅ |
-| `steps[].uses` | ✅ |
-| `steps[].run` | ✅ |
-| `steps[].with` | ✅ |
-| `steps[].if` | ✅ |
-| `steps[].continue-on-error` | ✅ |
-| `steps[].shell` | ✅ |
-| `steps[].working-directory` | ✅ |
-| `${{ github.* }}` / `${{ env.* }}` / `${{ secrets.* }}` | ✅ |
-| `${{ runner.* }}` / `${{ inputs.* }}` / `${{ needs.* }}` | ✅ |
-| `${{ contains() }}` / `${{ startsWith() }}` / `${{ endsWith() }}` | ✅ |
-| `${{ success() }}` / `${{ failure() }}` / `${{ always() }}` | ✅ |
-| Matrix strategy | 📋 Planned |
-| `runs-on` selection | 📋 Planned |
+Contributions are welcome! Feel free to open an issue or submit a pull request.
 
 ## License
 

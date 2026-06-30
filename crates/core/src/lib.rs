@@ -10,13 +10,15 @@
 pub mod actions;
 pub mod engine;
 pub mod expr;
+pub mod logging;
 pub mod parser;
 pub mod scheduler;
 pub mod types;
 pub mod workflow;
 
-pub use engine::Engine;
+pub use actions::ActionRegistry;
+pub use engine::{Engine, EngineResult};
+pub use logging::*;
 pub use parser::WorkflowParser;
 pub use scheduler::JobScheduler;
-pub use actions::ActionRegistry;
 pub use types::*;

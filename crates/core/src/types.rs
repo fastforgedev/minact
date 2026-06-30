@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use serde::Serialize;
+
 /// Represents the execution context available during workflow runs.
 #[derive(Debug, Clone, Default)]
 pub struct Context {
@@ -56,9 +58,18 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
             Value::String(s) => s.clone(),
-            Value::Array(a) => format!("[{}]", a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")),
+            Value::Array(a) => format!(
+                "[{}]",
+                a.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Value::Map(m) => {
-                let items: Vec<String> = m.iter().map(|(k, v)| format!("{}: {}", k, v.to_string())).collect();
+                let items: Vec<String> = m
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k, v.to_string()))
+                    .collect();
                 format!("{{{}}}", items.join(", "))
             }
         }
@@ -66,16 +77,24 @@ impl Value {
 }
 
 impl From<&str> for Value {
-    fn from(s: &str) -> Self { Value::String(s.to_string()) }
+    fn from(s: &str) -> Self {
+        Value::String(s.to_string())
+    }
 }
 impl From<String> for Value {
-    fn from(s: String) -> Self { Value::String(s) }
+    fn from(s: String) -> Self {
+        Value::String(s)
+    }
 }
 impl From<bool> for Value {
-    fn from(b: bool) -> Self { Value::Bool(b) }
+    fn from(b: bool) -> Self {
+        Value::Bool(b)
+    }
 }
 impl From<i64> for Value {
-    fn from(i: i64) -> Self { Value::Int(i) }
+    fn from(i: i64) -> Self {
+        Value::Int(i)
+    }
 }
 
 /// The result of running a step or action.
@@ -88,7 +107,8 @@ pub struct StepResult {
 }
 
 /// Conclusion status of a step.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StepConclusion {
     Success,
     Failure,
