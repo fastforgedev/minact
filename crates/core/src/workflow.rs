@@ -228,6 +228,7 @@ pub struct RunDefaults {
 
     /// Default working directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "working-directory")]
     pub working_directory: Option<String>,
 }
 

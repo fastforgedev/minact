@@ -171,9 +171,25 @@ impl Engine {
         let mut job_success = true;
         let mut job_conclusion = StepConclusion::Success;
 
-        // Execute each step
-        for (step_idx, step) in job.steps.iter().enumerate() {
-            let step_result = self.execute_step(step, step_idx, job_id, ctx).await?;
+        // Resolve default working directory from job/workflow defaults
+let default_wd = job
+    .defaults
+    .as_ref()
+    .and_then(|d| d.run.as_ref())
+    .and_then(|r| r.working_directory.clone())
+    .or_else(|| {
+        workflow
+            .defaults
+            .as_ref()
+            .and_then(|d| d.run.as_ref())
+            .and_then(|r| r.working_directory.clone())
+    });
+
+// Execute each step
+for (step_idx, step) in job.steps.iter().enumerate() {
+    let step_result = self
+        .execute_step(step, step_idx, job_id, default_wd.as_deref(), ctx)
+        .await?;
             let step_success = step_result.success;
 
             // Record step outputs in context
@@ -240,6 +256,7 @@ impl Engine {
         step: &Step,
         step_idx: usize,
         job_id: &str,
+        default_wd: Option<&str>,
         ctx: &Context,
     ) -> Result<StepResult, WorkflowError> {
         let step_name = if step.name.is_empty() {
@@ -275,12 +292,18 @@ impl Engine {
             }
         }
 
+        // Resolve effective working directory: step → job defaults → workflow defaults → workspace
+        let effective_wd = step
+            .working_directory
+            .clone()
+            .or_else(|| default_wd.map(String::from));
+
         if let Some(ref uses) = step.uses {
-            // Action step
-            self.execute_action_step(step, uses, step_name, ctx).await
+            self.execute_action_step(step, uses, step_name, effective_wd, ctx)
+                .await
         } else if let Some(ref run) = step.run {
-            // Shell step
-            self.execute_shell_step(step, run, step_name, ctx).await
+            self.execute_shell_step(step, run, step_name, effective_wd, ctx)
+                .await
         } else {
             Err(WorkflowError::Other(format!(
                 "Step '{}' has no 'uses' or 'run'",
@@ -295,6 +318,7 @@ impl Engine {
         step: &Step,
         uses: &str,
         step_name: String,
+        effective_wd: Option<String>,
         ctx: &Context,
     ) -> Result<StepResult, WorkflowError> {
         // Parse action reference: "actions/checkout@v4" → "actions/checkout"
@@ -328,7 +352,7 @@ impl Engine {
             step_env.entry(k.clone()).or_insert_with(|| v.clone());
         }
 
-        let working_dir = step.working_directory.as_ref().map(|wd| {
+        let working_dir = effective_wd.as_ref().map(|wd| {
             if Path::new(wd).is_absolute() {
                 PathBuf::from(wd)
             } else {
@@ -386,6 +410,7 @@ impl Engine {
         step: &Step,
         run: &str,
         step_name: String,
+        effective_wd: Option<String>,
         ctx: &Context,
     ) -> Result<StepResult, WorkflowError> {
         // Resolve expressions in the run command
@@ -402,8 +427,7 @@ impl Engine {
             other => (other, None),
         };
 
-        let working_dir = step
-            .working_directory
+        let working_dir = effective_wd
             .as_ref()
             .map(|wd| {
                 if Path::new(wd).is_absolute() {
@@ -772,5 +796,127 @@ jobs:
         assert!(!events
             .iter()
             .any(|event| matches!(event, LogEvent::CommandStarted { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_working_directory_resolution() {
+        // Create a temp workspace with known subdirectories
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().to_path_buf();
+        let sub_dir = workspace.join("sub");
+        std::fs::create_dir(&sub_dir).unwrap();
+
+        // Write a marker file in each directory so we can verify CWD
+        std::fs::write(workspace.join("marker-root.txt"), "root").unwrap();
+        std::fs::write(sub_dir.join("marker-sub.txt"), "sub").unwrap();
+
+        let reporter = Arc::new(CollectingReporter::default());
+
+        // Test 1: workflow-level defaults.run.working-directory
+        let yaml = r#"
+name: WorkflowDefaults
+on: workflow_dispatch
+defaults:
+  run:
+    working-directory: sub
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check CWD
+        run: test -f marker-sub.txt
+"#;
+        let workflow = WorkflowParser::parse_yaml(yaml, None).unwrap();
+        let engine = Engine::with_reporter(workspace.clone(), reporter.clone());
+        let result = engine
+            .run_workflow(&workflow, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "workflow-level defaults should set CWD to sub/"
+        );
+
+        // Test 2: job-level defaults overrides workflow-level
+        let yaml2 = r#"
+name: JobDefaults
+on: workflow_dispatch
+defaults:
+  run:
+    working-directory: sub
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Check CWD
+        run: test -f marker-root.txt
+"#;
+        let workflow2 = WorkflowParser::parse_yaml(yaml2, None).unwrap();
+        let result2 = engine
+            .run_workflow(&workflow2, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            result2.success,
+            "job-level defaults should override workflow-level"
+        );
+
+        // Test 3: step-level working-directory overrides job defaults
+        let yaml3 = r#"
+name: StepOverride
+on: workflow_dispatch
+defaults:
+  run:
+    working-directory: sub
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Override to root
+        working-directory: .
+        run: test -f marker-root.txt
+      - name: Inherit from defaults
+        run: test -f marker-sub.txt
+"#;
+        let workflow3 = WorkflowParser::parse_yaml(yaml3, None).unwrap();
+        let result3 = engine
+            .run_workflow(&workflow3, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            result3.success,
+            "both step override and default inherit should work"
+        );
+
+        // Test 4: all levels working together
+        let yaml4 = r#"
+name: AllLevels
+on: workflow_dispatch
+defaults:
+  run:
+    working-directory: sub
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Step override back to sub
+        working-directory: sub
+        run: test -f marker-sub.txt
+"#;
+        let workflow4 = WorkflowParser::parse_yaml(yaml4, None).unwrap();
+        let result4 = engine
+            .run_workflow(&workflow4, "workflow_dispatch", HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            result4.success,
+            "all three levels should compose correctly"
+        );
     }
 }
