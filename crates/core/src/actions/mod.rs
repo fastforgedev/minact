@@ -1,11 +1,30 @@
 //! Action trait and built-in action registry.
 //!
-//! Actions are reusable units of work that can be referenced via `uses:` in workflow steps.
+//! Actions are reusable units of work that can be referenced via `uses:` in
+//! workflow steps. There are two kinds and they are looked up in this order:
+//!
+//! * **Registered** — implemented in Rust and held in an [`ActionRegistry`].
+//!   minact ships four, and an embedding tool adds its own. They need nothing
+//!   fetched and nothing installed, which is why they win over a same-named
+//!   action published on GitHub.
+//! * **External** — the ones written in the workflow as `owner/repo@ref`,
+//!   `./local-action` or `docker://image`. They carry an `action.yml` saying
+//!   how to run them, and [`store`] fetches them when they are remote.
 
+pub mod external;
+pub mod manifest;
+pub mod reference;
+pub mod store;
+
+pub use external::{action_inputs, resolve as resolve_external, ActionInputs, ResolvedAction};
+pub use manifest::{ActionManifest, ActionRuns, DockerImageSource};
+pub use reference::{registry_name, ActionRef};
+pub use store::ActionStore;
+
+use crate::types::{Context, StepConclusion, WorkflowError};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
-use async_trait::async_trait;
-use crate::types::{Context, StepConclusion, WorkflowError};
 
 /// The output from a single action execution.
 #[derive(Debug, Clone)]
@@ -123,13 +142,19 @@ impl Action for CheckoutAction {
         if !ctx.workspace.exists() {
             std::fs::create_dir_all(&ctx.workspace)?;
         }
-        tracing::info!("[actions/checkout] Workspace ready at: {}", ctx.workspace.display());
+        tracing::info!(
+            "[actions/checkout] Workspace ready at: {}",
+            ctx.workspace.display()
+        );
 
         Ok(ActionOutput {
             success: true,
             conclusion: StepConclusion::Success,
             outputs: HashMap::from([
-                ("repository".to_string(), ctx.context.github.repository.clone()),
+                (
+                    "repository".to_string(),
+                    ctx.context.github.repository.clone(),
+                ),
                 ("ref".to_string(), ctx.context.github.ref_name.clone()),
                 ("sha".to_string(), ctx.context.github.sha.clone()),
             ]),
@@ -153,12 +178,12 @@ impl Action for CacheAction {
     fn validate(&self, ctx: &ActionContext) -> Result<(), WorkflowError> {
         if !ctx.inputs.contains_key("path") {
             return Err(WorkflowError::Other(
-                "actions/cache requires 'path' input".to_string()
+                "actions/cache requires 'path' input".to_string(),
             ));
         }
         if !ctx.inputs.contains_key("key") {
             return Err(WorkflowError::Other(
-                "actions/cache requires 'key' input".to_string()
+                "actions/cache requires 'key' input".to_string(),
             ));
         }
         Ok(())
@@ -203,9 +228,7 @@ impl Action for CacheAction {
         Ok(ActionOutput {
             success: true,
             conclusion: StepConclusion::Success,
-            outputs: HashMap::from([
-                ("cache-hit".to_string(), cache_hit.to_string()),
-            ]),
+            outputs: HashMap::from([("cache-hit".to_string(), cache_hit.to_string())]),
             artifacts: vec![],
         })
     }
@@ -256,12 +279,12 @@ impl Action for UploadArtifactAction {
     fn validate(&self, ctx: &ActionContext) -> Result<(), WorkflowError> {
         if !ctx.inputs.contains_key("name") {
             return Err(WorkflowError::Other(
-                "actions/upload-artifact requires 'name' input".to_string()
+                "actions/upload-artifact requires 'name' input".to_string(),
             ));
         }
         if !ctx.inputs.contains_key("path") {
             return Err(WorkflowError::Other(
-                "actions/upload-artifact requires 'path' input".to_string()
+                "actions/upload-artifact requires 'path' input".to_string(),
             ));
         }
         Ok(())
@@ -282,7 +305,11 @@ impl Action for UploadArtifactAction {
 
         if src_path.exists() {
             copy_recursive(&src_path, &artifact_dir)?;
-            tracing::info!("[actions/upload-artifact] Uploaded '{}' from {}", name, path);
+            tracing::info!(
+                "[actions/upload-artifact] Uploaded '{}' from {}",
+                name,
+                path
+            );
         } else {
             tracing::warn!("[actions/upload-artifact] Path '{}' does not exist", path);
         }
@@ -314,7 +341,7 @@ impl Action for DownloadArtifactAction {
     fn validate(&self, ctx: &ActionContext) -> Result<(), WorkflowError> {
         if !ctx.inputs.contains_key("name") {
             return Err(WorkflowError::Other(
-                "actions/download-artifact requires 'name' input".to_string()
+                "actions/download-artifact requires 'name' input".to_string(),
             ));
         }
         Ok(())
@@ -322,7 +349,11 @@ impl Action for DownloadArtifactAction {
 
     async fn run(&self, ctx: &ActionContext) -> Result<ActionOutput, WorkflowError> {
         let name = &ctx.inputs["name"];
-        let dest = ctx.inputs.get("path").cloned().unwrap_or_else(|| ".".to_string());
+        let dest = ctx
+            .inputs
+            .get("path")
+            .cloned()
+            .unwrap_or_else(|| ".".to_string());
 
         let artifact_dir = ctx.workspace.join(".minact-artifacts").join(name);
         let dest_path = if Path::new(&dest).is_absolute() {
@@ -334,7 +365,11 @@ impl Action for DownloadArtifactAction {
         if artifact_dir.exists() {
             std::fs::create_dir_all(&dest_path)?;
             copy_recursive(&artifact_dir, &dest_path)?;
-            tracing::info!("[actions/download-artifact] Downloaded '{}' to {}", name, dest);
+            tracing::info!(
+                "[actions/download-artifact] Downloaded '{}' to {}",
+                name,
+                dest
+            );
         } else {
             tracing::warn!("[actions/download-artifact] Artifact '{}' not found", name);
         }

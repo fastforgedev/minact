@@ -5,6 +5,7 @@
 //! - Expression evaluation (`${{ }}`)
 //! - Job DAG scheduling
 //! - Built-in actions (checkout, cache, upload/download artifact)
+//! - Actions fetched from GitHub: JavaScript, composite and container
 //! - Full workflow execution engine
 
 pub mod actions;
@@ -19,7 +20,7 @@ pub mod scheduler;
 pub mod types;
 pub mod workflow;
 
-pub use actions::ActionRegistry;
+pub use actions::{ActionManifest, ActionRef, ActionRegistry, ActionRuns, ActionStore};
 pub use commands::{parse_key_value_file, parse_path_file, parse_workflow_command};
 pub use config::{Config, RunnerSpec, DEFAULT_CONFIG_FILES};
 pub use engine::{Engine, EngineResult};
