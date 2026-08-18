@@ -12,6 +12,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 glob = { workspace = true }
 tempfile = { workspace = true }
@@ -19,3 +20,8 @@ sha2 = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Cancelling a step has to reach the processes the step spawned, which means
+# signalling the process group rather than just the shell.
+libc = "0.2"
