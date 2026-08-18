@@ -4,12 +4,17 @@
 //!   minact run [--file <path>] [--event <event>] [--workspace <dir>]
 //!   minact list [--dir <path>]
 //!   minact validate <file>
+//!   minact studio [--port <port>] [--workspace <dir>] [--open]
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
+use minact_studio::StudioServer;
+use tokio::net::TcpListener;
 
 use minact_core::{
     print_plain_summary, print_pretty_summary, CancellationToken, Config, Engine, JsonReporter,
@@ -73,6 +78,30 @@ enum Commands {
         /// Path to workflow file
         file: PathBuf,
     },
+
+    /// Launch the Studio web UI
+    Studio {
+        /// Port to listen on (0 picks a free one)
+        #[arg(short, long, default_value_t = 4000)]
+        port: u16,
+
+        /// Address to bind
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Project directory to serve (default: current directory)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+
+        /// Extra directory of workflow files to browse, on top of the ones
+        /// minact discovers (repeatable)
+        #[arg(long = "workflows", value_name = "DIR")]
+        workflow_dirs: Vec<PathBuf>,
+
+        /// Open the UI in the default browser
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 /// Where `discover_workflows` looks, rendered from the parser's own list so
@@ -122,6 +151,13 @@ async fn main() -> anyhow::Result<()> {
         } => cmd_run(file, event, workspace, input, config, log_format).await,
         Commands::List { dir, verbose } => cmd_list(dir, verbose),
         Commands::Validate { file } => cmd_validate(file),
+        Commands::Studio {
+            port,
+            host,
+            workspace,
+            workflow_dirs,
+            open,
+        } => cmd_studio(port, host, workspace, workflow_dirs, open).await,
     }
 }
 
@@ -220,6 +256,73 @@ async fn cmd_run(
     }
 
     Ok(())
+}
+
+async fn cmd_studio(
+    port: u16,
+    host: String,
+    workspace: Option<PathBuf>,
+    workflow_dirs: Vec<PathBuf>,
+    open: bool,
+) -> anyhow::Result<()> {
+    let workspace = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let workspace = workspace.canonicalize().unwrap_or(workspace);
+
+    let ip: IpAddr = host
+        .parse()
+        .with_context(|| format!("Invalid --host address: {}", host))?;
+
+    // Studio runs shell commands on this machine on request, so exposing it
+    // beyond loopback hands anyone who can reach the port a shell.
+    if !ip.is_loopback() {
+        eprintln!(
+            "warning: binding to {} exposes workflow execution to your network",
+            ip
+        );
+    }
+
+    // Bind before serving so the printed URL is the port actually in use —
+    // `--port 0` has no other way to report it.
+    let listener = TcpListener::bind(SocketAddr::new(ip, port))
+        .await
+        .with_context(|| format!("Could not bind {}:{}", ip, port))?;
+    let url = format!("http://{}", listener.local_addr()?);
+
+    println!("minact studio");
+    println!("  workspace  {}", workspace.display());
+    for dir in &workflow_dirs {
+        println!("  workflows  {}", dir.display());
+    }
+    println!("  listening  {}", url);
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    if open {
+        open_browser(&url);
+    }
+
+    StudioServer::new(workspace)
+        .with_workflow_dirs(workflow_dirs)
+        .serve_on(listener)
+        .await?;
+
+    Ok(())
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let command = ("open", vec![url]);
+    #[cfg(target_os = "windows")]
+    let command = ("cmd", vec!["/C", "start", "", url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let command = ("xdg-open", vec![url]);
+
+    if let Err(err) = std::process::Command::new(command.0)
+        .args(&command.1)
+        .spawn()
+    {
+        eprintln!("warning: could not open a browser ({}). Visit {}", err, url);
+    }
 }
 
 fn cmd_list(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
