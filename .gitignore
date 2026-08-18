@@ -1,6 +1,7 @@
 # Rust
 target/
-Cargo.lock
+# Cargo.lock is intentionally NOT ignored: this workspace ships the `minact`
+# binary, so the lockfile is what makes CI and local builds reproducible.
 
 # IDE
 .idea/
@@ -15,3 +16,5 @@ Thumbs.db
 
 # Minact
 .minact-artifacts/
+# Run history Studio records per project; local state, not source.
+.minact/runs/

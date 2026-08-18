@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Run both legs even if one fails — the Linux/macOS split is exactly
+      # what surfaces shell differences (dash vs bash) in step execution.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Smoke-test the binary itself, not just the library, so a broken CLI
+      # cannot pass CI.
+      - name: Validate the example workflows
+        run: |
+          cargo run --quiet -- validate examples/ci.yml
+          cargo run --quiet -- validate examples/outputs.yml
+          cargo run --quiet -- validate examples/matrix.yml
+
+      - name: Run the matrix example
+        run: cargo run --quiet -- run --file examples/matrix.yml --event push
+
+      - name: Run the outputs example
+        run: |
+          # This example deliberately fails a job to exercise the failure
+          # paths, so a non-zero exit is the expected outcome.
+          if cargo run --quiet -- run --file examples/outputs.yml --event push; then
+            echo "expected the example to exit non-zero"
+            exit 1
+          fi
