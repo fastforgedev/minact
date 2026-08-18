@@ -8,6 +8,7 @@
 //! - Full workflow execution engine
 
 pub mod actions;
+pub mod commands;
 pub mod engine;
 pub mod expr;
 pub mod logging;
@@ -17,6 +18,7 @@ pub mod types;
 pub mod workflow;
 
 pub use actions::ActionRegistry;
+pub use commands::{parse_key_value_file, parse_path_file, parse_workflow_command};
 pub use engine::{Engine, EngineResult};
 pub use logging::*;
 pub use parser::WorkflowParser;
