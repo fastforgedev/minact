@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::workflow::*;
 use crate::types::WorkflowError;
+use crate::workflow::*;
 
 /// Represents a node in the job dependency graph.
 #[derive(Debug, Clone)]
@@ -48,6 +48,19 @@ impl JobScheduler {
     /// Returns a list of job IDs in execution order.
     /// Returns an error if a circular dependency is detected.
     pub fn resolve_execution_order(&self) -> Result<Vec<String>, WorkflowError> {
+        // A `needs:` pointing at a job that does not exist would otherwise
+        // stall the topological sort and be misreported as a cycle.
+        for (id, node) in &self.nodes {
+            for dep in &node.dependencies {
+                if !self.nodes.contains_key(dep) {
+                    return Err(WorkflowError::Other(format!(
+                        "Job '{}' needs unknown job '{}'",
+                        id, dep
+                    )));
+                }
+            }
+        }
+
         // Build in-degree counts
         let mut in_degree: HashMap<String, usize> = HashMap::new();
         let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
@@ -122,6 +135,14 @@ impl JobScheduler {
             layers[depth].push(job_id.clone());
         }
 
+        // Jobs reach here in `HashMap` order, so without this the same
+        // workflow lays out differently from one run to the next — and a job
+        // that runs first one time runs second the next. Independent jobs have
+        // no required order, so pick a stable one.
+        for layer in &mut layers {
+            layer.sort();
+        }
+
         Ok(layers)
     }
 
@@ -193,7 +214,10 @@ mod tests {
             outputs: None,
             runs_on: None,
             timeout_minutes: None,
+            continue_on_error: None,
             strategy: None,
+            container: None,
+            services: HashMap::new(),
         }
     }
 
@@ -201,8 +225,14 @@ mod tests {
     fn test_linear_dependencies() {
         let mut jobs = HashMap::new();
         jobs.insert("build".to_string(), make_job("Build", None));
-        jobs.insert("test".to_string(), make_job("Test", Some(vec!["build".to_string()])));
-        jobs.insert("deploy".to_string(), make_job("Deploy", Some(vec!["test".to_string()])));
+        jobs.insert(
+            "test".to_string(),
+            make_job("Test", Some(vec!["build".to_string()])),
+        );
+        jobs.insert(
+            "deploy".to_string(),
+            make_job("Deploy", Some(vec!["test".to_string()])),
+        );
 
         let workflow = make_workflow(jobs);
         let scheduler = JobScheduler::new(&workflow);
@@ -230,9 +260,21 @@ mod tests {
     fn test_diamond_dependency() {
         let mut jobs = HashMap::new();
         jobs.insert("setup".to_string(), make_job("Setup", None));
-        jobs.insert("build-a".to_string(), make_job("Build A", Some(vec!["setup".to_string()])));
-        jobs.insert("build-b".to_string(), make_job("Build B", Some(vec!["setup".to_string()])));
-        jobs.insert("merge".to_string(), make_job("Merge", Some(vec!["build-a".to_string(), "build-b".to_string()])));
+        jobs.insert(
+            "build-a".to_string(),
+            make_job("Build A", Some(vec!["setup".to_string()])),
+        );
+        jobs.insert(
+            "build-b".to_string(),
+            make_job("Build B", Some(vec!["setup".to_string()])),
+        );
+        jobs.insert(
+            "merge".to_string(),
+            make_job(
+                "Merge",
+                Some(vec!["build-a".to_string(), "build-b".to_string()]),
+            ),
+        );
 
         let workflow = make_workflow(jobs);
         let scheduler = JobScheduler::new(&workflow);
@@ -255,6 +297,56 @@ mod tests {
         let result = scheduler.resolve_execution_order();
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), WorkflowError::CircularDependency));
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkflowError::CircularDependency
+        ));
+    }
+
+    #[test]
+    fn test_unknown_dependency_is_reported_clearly() {
+        let mut jobs = HashMap::new();
+        jobs.insert(
+            "test".to_string(),
+            make_job("Test", Some(vec!["buidl".to_string()])),
+        );
+
+        let workflow = make_workflow(jobs);
+        let scheduler = JobScheduler::new(&workflow);
+        let err = scheduler.resolve_execution_order().unwrap_err().to_string();
+
+        // A typo in `needs:` must not masquerade as a dependency cycle.
+        assert!(err.contains("needs unknown job 'buidl'"), "{}", err);
+    }
+
+    #[test]
+    fn parallel_layers_are_ordered_the_same_every_time() {
+        let mut jobs = HashMap::new();
+        jobs.insert("setup".to_string(), make_job("Setup", None));
+        for id in ["zebra", "alpha", "middle"] {
+            jobs.insert(
+                id.to_string(),
+                make_job(id, Some(vec!["setup".to_string()])),
+            );
+        }
+        let workflow = make_workflow(jobs);
+
+        // Independent jobs have no required order, but an arbitrary one makes
+        // runs of the same workflow disagree with each other and with the
+        // graph a UI draws.
+        for _ in 0..8 {
+            let layers = JobScheduler::new(&workflow)
+                .resolve_parallel_layers()
+                .expect("layers");
+            assert_eq!(layers[0], vec!["setup".to_string()]);
+            assert_eq!(
+                layers[1],
+                vec![
+                    "alpha".to_string(),
+                    "middle".to_string(),
+                    "zebra".to_string()
+                ],
+            );
+        }
     }
 }

@@ -1,12 +1,13 @@
 //! Structured workflow execution logging.
 
 use async_trait::async_trait;
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::types::StepConclusion;
 
 /// Stream a command output line came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandStream {
     Stdout,
@@ -14,7 +15,10 @@ pub enum CommandStream {
 }
 
 /// A structured event emitted while a workflow runs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` is part of the contract: a consumer that persists events has
+/// to be able to read them back, which is how run history and replay work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LogEvent {
     WorkflowStarted {
@@ -32,6 +36,13 @@ pub enum LogEvent {
         job_id: String,
         job_name: String,
         condition: String,
+    },
+    /// A job instance that never started, e.g. a matrix instance dropped
+    /// because an earlier one failed under `fail-fast`.
+    JobCancelled {
+        job_id: String,
+        job_name: String,
+        reason: String,
     },
     JobFinished {
         job_id: String,
@@ -84,7 +95,7 @@ pub enum LogEvent {
 }
 
 /// Severity for non-structured messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Info,
@@ -92,10 +103,63 @@ pub enum LogLevel {
     Error,
 }
 
+/// Which job instance and step an event came from.
+///
+/// [`LogEvent`] alone cannot say: `CommandOutput` and the `Action*` variants
+/// carry no identity, and inferring it from the preceding `StepStarted` only
+/// works while one step runs at a time. The scope makes the correlation
+/// explicit, which is what a UI needs and what parallel execution will require.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventScope {
+    /// The job *instance* id — `build` normally, `build (os=macos)` under a
+    /// matrix — so sibling instances never share a scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
+}
+
+impl EventScope {
+    pub fn job(job_id: impl Into<String>) -> Self {
+        Self {
+            job_id: Some(job_id.into()),
+            step_index: None,
+        }
+    }
+
+    pub fn step(job_id: impl Into<String>, step_index: usize) -> Self {
+        Self {
+            job_id: Some(job_id.into()),
+            step_index: Some(step_index),
+        }
+    }
+}
+
+/// A [`LogEvent`] with everything needed to order it and place it in a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRecord {
+    /// Position in the run, starting at 0. Survives a reconnect: a client that
+    /// has seen up to `seq` asks for everything after it.
+    pub seq: u64,
+    pub ts: DateTime<Utc>,
+    #[serde(default)]
+    pub scope: EventScope,
+    pub event: LogEvent,
+}
+
 /// Receives workflow execution log events.
 #[async_trait]
 pub trait Reporter: Send + Sync {
     async fn emit(&self, event: LogEvent);
+
+    /// The same event, plus its sequence number, timestamp and scope.
+    ///
+    /// The engine calls this; the default throws the envelope away and falls
+    /// back to [`Reporter::emit`], so a console reporter needs no changes.
+    /// Override it when you need ordering or job/step correlation.
+    async fn emit_record(&self, record: LogRecord) {
+        self.emit(record.event).await;
+    }
 }
 
 /// Reporter that forwards events to tracing.
@@ -125,6 +189,11 @@ impl Reporter for TracingReporter {
             }
             LogEvent::JobSkipped { condition, .. } => {
                 tracing::info!("  → Skipped (condition: {})", condition);
+            }
+            LogEvent::JobCancelled {
+                job_name, reason, ..
+            } => {
+                tracing::warn!("  ◯ Cancelled '{}' ({})", job_name, reason);
             }
             LogEvent::JobFinished {
                 job_name, success, ..

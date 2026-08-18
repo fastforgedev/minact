@@ -6,16 +6,15 @@
 //!   minact validate <file>
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use clap::{Parser, Subcommand};
+
 use minact_core::{
-    CommandStream, Engine, LogEvent, LogLevel, Reporter, StepConclusion, WorkflowParser,
+    print_plain_summary, print_pretty_summary, CancellationToken, Config, Engine, JsonReporter,
+    PlainReporter, PrettyReporter, Reporter, WorkflowParser,
 };
-use tokio::sync::Mutex;
 
 #[derive(Parser)]
 #[command(
@@ -48,6 +47,11 @@ enum Commands {
         #[arg(short, long, value_parser = parse_key_val)]
         input: Vec<KeyVal>,
 
+        /// Project configuration file
+        /// (default: .minact/config.yml, if present)
+        #[arg(long)]
+        config: Option<PathBuf>,
+
         /// Log output format
         #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
         log_format: LogFormat,
@@ -69,6 +73,15 @@ enum Commands {
         /// Path to workflow file
         file: PathBuf,
     },
+}
+
+/// Where `discover_workflows` looks, rendered from the parser's own list so
+/// the message can never drift from the behaviour.
+fn search_paths_message() -> String {
+    format!(
+        "Looked in: {}",
+        WorkflowParser::search_path_summary(&WorkflowParser::default_search_paths())
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +117,9 @@ async fn main() -> anyhow::Result<()> {
             event,
             workspace,
             input,
+            config,
             log_format,
-        } => cmd_run(file, event, workspace, input, log_format).await,
+        } => cmd_run(file, event, workspace, input, config, log_format).await,
         Commands::List { dir, verbose } => cmd_list(dir, verbose),
         Commands::Validate { file } => cmd_validate(file),
     }
@@ -116,6 +130,7 @@ async fn cmd_run(
     event: String,
     workspace: Option<PathBuf>,
     input: Vec<KeyVal>,
+    config: Option<PathBuf>,
     log_format: LogFormat,
 ) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -133,9 +148,9 @@ async fn cmd_run(
         match workflows.len() {
             0 => {
                 anyhow::bail!(
-                    "No workflow files found in {}\n\
-                     Looked in: .minact/workflows/, .github/workflows/, minact.yml/yaml",
-                    workspace.display()
+                    "No workflow files found in {}\n{}",
+                    workspace.display(),
+                    search_paths_message()
                 );
             }
             1 => workflows.into_iter().next().unwrap(),
@@ -161,9 +176,37 @@ async fn cmd_run(
         LogFormat::Plain => Arc::new(PlainReporter::default()),
         LogFormat::Json => Arc::new(JsonReporter::default()),
     };
-    let engine = Engine::with_reporter(workspace, reporter);
+    // `runs-on:` only means something once labels are mapped to real places.
+    let project_config = match &config {
+        Some(path) => Config::load(path)?,
+        None => match Config::discover(&workspace)? {
+            Some((path, config)) => {
+                if matches!(log_format, LogFormat::Plain) {
+                    println!("Using config from: {}", path.display());
+                }
+                config
+            }
+            None => Config::default(),
+        },
+    };
 
-    let result = engine.run_workflow(&workflow, &event, inputs).await?;
+    let engine = Engine::with_reporter(workspace, reporter).with_config(project_config);
+
+    // Steps run in their own process group, so Ctrl+C no longer reaches them
+    // on its own. Turn it into a cancellation instead, which kills the group
+    // and still prints a summary for what did run.
+    let cancel = CancellationToken::new();
+    let on_signal = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\nStopping — cancelling the run…");
+            on_signal.cancel();
+        }
+    });
+
+    let result = engine
+        .run_workflow_cancellable(&workflow, &event, inputs, cancel)
+        .await?;
 
     // Print summary
     match log_format {
@@ -179,436 +222,13 @@ async fn cmd_run(
     Ok(())
 }
 
-fn sorted_job_results(
-    result: &minact_core::EngineResult,
-) -> Vec<(&String, &minact_core::engine::JobResult)> {
-    let mut jobs: Vec<_> = result.job_results.iter().collect();
-    jobs.sort_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id));
-    jobs
-}
-
-fn print_pretty_summary(result: &minact_core::EngineResult) {
-    println!();
-    println!("{}", paint("Summary", Color::Bold));
-
-    for (job_id, job_result) in sorted_job_results(result) {
-        let status = match job_result.conclusion {
-            StepConclusion::Success => paint("✓", Color::Green),
-            StepConclusion::Failure => paint("✗", Color::Red),
-            StepConclusion::Cancelled => paint("◯", Color::Yellow),
-            StepConclusion::Skipped => paint("−", Color::Yellow),
-        };
-        println!("  {} {:<12} {}", status, job_id, job_result.job_name);
-    }
-}
-
-fn print_plain_summary(result: &minact_core::EngineResult) {
-    println!();
-    println!("summary   {}", result.workflow_name);
-
-    for (job_id, job_result) in sorted_job_results(result) {
-        let status = conclusion_symbol(&job_result.conclusion);
-        println!(
-            "summary   {} {:<12} {}",
-            status, job_id, job_result.job_name
-        );
-    }
-}
-
-fn conclusion_symbol(conclusion: &StepConclusion) -> &'static str {
-    match conclusion {
-        StepConclusion::Success => "✓",
-        StepConclusion::Failure => "✗",
-        StepConclusion::Cancelled => "◯",
-        StepConclusion::Skipped => "–",
-    }
-}
-
-#[derive(Default)]
-struct PlainReporter {
-    state: Mutex<PlainState>,
-}
-
-struct PlainState {
-    current_job: String,
-    width: usize,
-}
-
-impl Default for PlainState {
-    fn default() -> Self {
-        Self {
-            current_job: "workflow".to_string(),
-            width: 9,
-        }
-    }
-}
-
-#[async_trait]
-impl Reporter for PlainReporter {
-    async fn emit(&self, event: LogEvent) {
-        let mut state = self.state.lock().await;
-        match event {
-            LogEvent::WorkflowStarted {
-                workflow_name,
-                event_name,
-            } => {
-                print_prefixed(
-                    "workflow",
-                    state.width,
-                    format_args!("{} · {}", workflow_name, event_name),
-                );
-            }
-            LogEvent::ExecutionPlan { layers } => {
-                for layer in &layers {
-                    for job_id in layer {
-                        state.width = state.width.max(job_id.len());
-                    }
-                }
-                let plan = layers
-                    .iter()
-                    .map(|layer| layer.join(", "))
-                    .collect::<Vec<_>>()
-                    .join(" -> ");
-                print_prefixed("plan", state.width, format_args!("{}", plan));
-            }
-            LogEvent::JobStarted { job_id, job_name } => {
-                state.current_job = job_id.clone();
-                println!();
-                print_prefixed(&job_id, state.width, format_args!("{}", job_name));
-            }
-            LogEvent::JobSkipped {
-                job_id, condition, ..
-            } => {
-                print_prefixed(&job_id, state.width, format_args!("skipped {}", condition));
-            }
-            LogEvent::JobFinished {
-                job_id, success, ..
-            } => {
-                let status = if success {
-                    "✓ job done"
-                } else {
-                    "✗ job failed"
-                };
-                print_prefixed(&job_id, state.width, format_args!("{}", status));
-            }
-            LogEvent::StepStarted { step_name, .. } => {
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("{}", step_name),
-                );
-            }
-            LogEvent::StepSkipped { condition, .. } => {
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("skipped {}", condition),
-                );
-            }
-            LogEvent::ActionStarted { uses } => {
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("uses {}", uses),
-                );
-            }
-            LogEvent::ActionInput { name, value } => {
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("with {}={}", name, value),
-                );
-            }
-            LogEvent::ActionFinished {
-                success,
-                conclusion,
-            } => {
-                let status = if success { "✓ done" } else { "✗ failed" };
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("{} {}", status, conclusion_symbol(&conclusion)),
-                );
-            }
-            LogEvent::ActionError { message } => {
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("action error: {}", message),
-                );
-            }
-            LogEvent::CommandStarted {
-                command,
-                shell,
-                working_dir: _,
-            } => {
-                let mut lines = command.lines();
-                if let Some(first_line) = lines.next() {
-                    let shell = if shell == "bash" {
-                        String::new()
-                    } else {
-                        format!(" [{}]", shell)
-                    };
-                    print_prefixed(
-                        &state.current_job,
-                        state.width,
-                        format_args!("${} {}", shell, first_line),
-                    );
-                }
-                for line in lines {
-                    print_prefixed(&state.current_job, state.width, format_args!("  {}", line));
-                }
-            }
-            LogEvent::CommandOutput { stream, line } => {
-                let marker = match stream {
-                    CommandStream::Stdout => "│",
-                    CommandStream::Stderr => "│",
-                };
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("{} {}", marker, line),
-                );
-            }
-            LogEvent::CommandFinished { success, status } => {
-                let marker = if success { "✓ done" } else { "✗ failed" };
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("{} {}", marker, short_status(&status)),
-                );
-            }
-            LogEvent::Message { level, message } => {
-                let level = match level {
-                    LogLevel::Info => "info",
-                    LogLevel::Warn => "warn",
-                    LogLevel::Error => "error",
-                };
-                print_prefixed(
-                    &state.current_job,
-                    state.width,
-                    format_args!("{}: {}", level, message),
-                );
-            }
-        }
-    }
-}
-
-fn print_prefixed(prefix: &str, width: usize, args: std::fmt::Arguments<'_>) {
-    println!("{:<width$} {}", prefix, args, width = width);
-}
-
-fn short_status(status: &str) -> String {
-    status
-        .strip_prefix("exit status: ")
-        .map(|code| format!("exit {}", code))
-        .unwrap_or_else(|| status.to_string())
-}
-
-#[derive(Default)]
-struct PrettyReporter {
-    state: Mutex<PrettyState>,
-}
-
-#[derive(Default)]
-struct PrettyState {
-    current_job: String,
-}
-
-#[async_trait]
-impl Reporter for PrettyReporter {
-    async fn emit(&self, event: LogEvent) {
-        let mut state = self.state.lock().await;
-        match event {
-            LogEvent::WorkflowStarted {
-                workflow_name,
-                event_name,
-            } => {
-                println!(
-                    "{} {} {}",
-                    paint("●", Color::Cyan),
-                    paint(&workflow_name, Color::Bold),
-                    paint(&format!("· {}", event_name), Color::Dim)
-                );
-            }
-            LogEvent::ExecutionPlan { layers } => {
-                let plan = layers
-                    .iter()
-                    .map(|layer| layer.join(", "))
-                    .collect::<Vec<_>>()
-                    .join(" → ");
-                println!("  {} {}", paint("plan", Color::Dim), plan);
-            }
-            LogEvent::JobStarted { job_id, job_name } => {
-                state.current_job = job_id;
-                println!();
-                println!(
-                    "{} {} {}",
-                    paint("◆", Color::Blue),
-                    paint(&state.current_job, Color::Bold),
-                    paint(&job_name, Color::Dim)
-                );
-            }
-            LogEvent::JobSkipped {
-                job_id, condition, ..
-            } => {
-                println!(
-                    "  {} {} {}",
-                    paint("−", Color::Yellow),
-                    paint(&job_id, Color::Bold),
-                    paint(&format!("skipped {}", condition), Color::Dim)
-                );
-            }
-            LogEvent::JobFinished { success, .. } => {
-                if success {
-                    println!(
-                        "  {} {}",
-                        paint("✓", Color::Green),
-                        paint("job done", Color::Dim)
-                    );
-                } else {
-                    println!(
-                        "  {} {}",
-                        paint("✗", Color::Red),
-                        paint("job failed", Color::Red)
-                    );
-                }
-            }
-            LogEvent::StepStarted { step_name, .. } => {
-                println!(
-                    "  {} {}",
-                    paint("›", Color::Magenta),
-                    paint(&step_name, Color::Bold)
-                );
-            }
-            LogEvent::StepSkipped { condition, .. } => {
-                println!("    {} skipped {}", paint("−", Color::Yellow), condition);
-            }
-            LogEvent::ActionStarted { uses } => {
-                println!("    {} {}", paint("uses", Color::Dim), uses);
-            }
-            LogEvent::ActionInput { name, value } => {
-                println!("    {} {}={}", paint("with", Color::Dim), name, value);
-            }
-            LogEvent::ActionFinished { success, .. } => {
-                if success {
-                    println!(
-                        "    {} {}",
-                        paint("✓", Color::Green),
-                        paint("done", Color::Dim)
-                    );
-                } else {
-                    println!(
-                        "    {} {}",
-                        paint("✗", Color::Red),
-                        paint("failed", Color::Red)
-                    );
-                }
-            }
-            LogEvent::ActionError { message } => {
-                println!("    {} {}", paint("error", Color::Red), message);
-            }
-            LogEvent::CommandStarted { command, shell, .. } => {
-                let mut lines = command.lines();
-                if let Some(first_line) = lines.next() {
-                    let shell = if shell == "bash" {
-                        String::new()
-                    } else {
-                        format!(" [{}]", shell)
-                    };
-                    println!("    {}{} {}", paint("$", Color::Green), shell, first_line);
-                }
-                for line in lines {
-                    println!("      {}", line);
-                }
-            }
-            LogEvent::CommandOutput { stream, line } => {
-                let pipe = match stream {
-                    CommandStream::Stdout => paint("│", Color::Dim),
-                    CommandStream::Stderr => paint("│", Color::Yellow),
-                };
-                println!("    {} {}", pipe, line);
-            }
-            LogEvent::CommandFinished { success, status } => {
-                if success {
-                    println!(
-                        "    {} {}",
-                        paint("✓", Color::Green),
-                        paint(&short_status(&status), Color::Dim)
-                    );
-                } else {
-                    println!(
-                        "    {} {}",
-                        paint("✗", Color::Red),
-                        paint(&short_status(&status), Color::Red)
-                    );
-                }
-            }
-            LogEvent::Message { level, message } => {
-                let label = match level {
-                    LogLevel::Info => paint("info", Color::Dim),
-                    LogLevel::Warn => paint("warn", Color::Yellow),
-                    LogLevel::Error => paint("error", Color::Red),
-                };
-                println!("    {} {}", label, message);
-            }
-        }
-    }
-}
-
-enum Color {
-    Bold,
-    Dim,
-    Green,
-    Yellow,
-    Red,
-    Blue,
-    Cyan,
-    Magenta,
-}
-
-fn paint(text: &str, color: Color) -> String {
-    if !std::io::stdout().is_terminal() {
-        return text.to_string();
-    }
-
-    let code = match color {
-        Color::Bold => "1",
-        Color::Dim => "2",
-        Color::Green => "32",
-        Color::Yellow => "33",
-        Color::Red => "31",
-        Color::Blue => "34",
-        Color::Cyan => "36",
-        Color::Magenta => "35",
-    };
-    format!("\x1b[{}m{}\x1b[0m", code, text)
-}
-
-#[derive(Default)]
-struct JsonReporter {
-    output: Mutex<()>,
-}
-
-#[async_trait]
-impl Reporter for JsonReporter {
-    async fn emit(&self, event: LogEvent) {
-        let _guard = self.output.lock().await;
-        match serde_json::to_string(&event) {
-            Ok(line) => println!("{}", line),
-            Err(e) => eprintln!("failed to serialize log event: {}", e),
-        }
-        let _ = std::io::stdout().flush();
-    }
-}
-
 fn cmd_list(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
     let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let workflows = WorkflowParser::discover_workflows(&dir)?;
 
     if workflows.is_empty() {
         println!("No workflows found in {}", dir.display());
-        println!("Looked in: .minact/workflows/, .github/workflows/, minact.yml/yaml");
+        println!("{}", search_paths_message());
         return Ok(());
     }
 

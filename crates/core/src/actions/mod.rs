@@ -11,6 +11,7 @@
 //!   `./local-action` or `docker://image`. They carry an `action.yml` saying
 //!   how to run them, and [`store`] fetches them when they are remote.
 
+pub(crate) mod container;
 pub mod external;
 pub mod manifest;
 pub mod reference;
