@@ -1,0 +1,67 @@
+# minact project configuration.
+#
+# Copy to `.minact/config.yml` in your project, or pass it with
+# `minact run --config examples/config.yml`.
+#
+# The `runners:` section maps `runs-on:` labels to real places to run.
+#
+# Without this file every job runs on your machine, and a `runs-on:` naming a
+# platform you are not on is reported as a warning rather than silently
+# ignored. This file is how you make those labels mean something.
+
+runners:
+  # A container: real Linux, on any host. This is the one that closes the
+  # biggest gap — building Linux artifacts from a Mac.
+  ubuntu-latest:
+    type: docker
+    image: ubuntu:24.04
+
+  ubuntu-22.04:
+    type: docker
+    image: ubuntu:22.04
+
+  # Pin the architecture when the artifact has to match a specific one,
+  # rather than inheriting your host's.
+  ubuntu-x64:
+    type: docker
+    image: ubuntu:24.04
+    run-args: ["--platform", "linux/amd64"]
+    # Fetch the image instead of relying on a local copy.
+    pull: true
+
+  # An image with your toolchain already in it beats installing it per run.
+  android:
+    type: docker
+    image: ghcr.io/cirruslabs/android-sdk:34
+    user: root
+
+  # This machine. Name it explicitly to say "yes, host is correct here" and
+  # silence the fallback warning.
+  macos-latest:
+    type: local
+
+  self-hosted:
+    type: local
+
+  # Another machine, for what containers cannot give you: Windows, or real
+  # macOS hardware for signing and notarisation.
+  #
+  # The workspace is pushed with rsync before the job and pulled back after,
+  # so artifacts the remote produces land in your local workspace.
+  # Requires key-based SSH login that already works non-interactively.
+  windows-latest:
+    type: ssh
+    host: win-builder.local
+    user: builder
+    remote-workspace: C:/minact/workspace
+
+  mac-signer:
+    type: ssh
+    host: mac-mini.local
+    user: ci
+    port: 22
+    identity-file: ~/.ssh/id_ed25519
+    remote-workspace: /Users/ci/minact-workspace
+    # Turn sync off when the remote already has the tree, e.g. a shared
+    # checkout it updates itself.
+    sync: true

@@ -1,0 +1,123 @@
+# Passing data between steps and jobs, and reacting to failure.
+#
+# Run it with:
+#   minact run --file examples/outputs.yml --event push
+#
+# The `package` job deliberately fails so you can watch the control flow:
+# `publish` is skipped, `rollback` runs because a dependency failed, and
+# `notify` runs either way.
+
+name: Outputs and control flow
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_channel:
+        description: "Channel to publish to"
+        required: false
+        default: stable
+
+env:
+  APP_NAME: my-app
+  # Non-string scalars are coerced, the same as on GitHub.
+  RETRIES: 3
+
+jobs:
+  version:
+    name: Compute version
+    steps:
+      # Step outputs are written to the file named by $GITHUB_OUTPUT.
+      - id: meta
+        name: Derive version
+        run: |
+          echo "version=1.4.2" >> "$GITHUB_OUTPUT"
+          echo "channel=${{ inputs.release_channel }}" >> "$GITHUB_OUTPUT"
+
+      # Multi-line values use the heredoc form.
+      - id: notes
+        name: Write release notes
+        run: |
+          {
+            echo "body<<NOTES"
+            echo "- fixed the thing"
+            echo "- improved the other thing"
+            echo "NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+      # $GITHUB_ENV exports a variable to every later step in this job.
+      - name: Export build id
+        run: echo "BUILD_ID=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Read it back
+        run: |
+          echo "version = ${{ steps.meta.outputs.version }}"
+          echo "channel = ${{ steps.meta.outputs.channel }}"
+          echo "build   = $BUILD_ID (retries: $RETRIES)"
+
+    # Job outputs are readable by dependent jobs as needs.<job>.outputs.<name>.
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      notes: ${{ steps.notes.outputs.body }}
+
+  package:
+    name: Package
+    needs: [version]
+    steps:
+      - name: Build
+        run: echo "Packaging ${{ env.APP_NAME }} ${{ needs.version.outputs.version }}"
+
+      # A tolerated failure: the outcome is `failure` but the conclusion is
+      # `success`, so the job carries on.
+      - id: optional
+        name: Optional signing
+        continue-on-error: true
+        run: exit 1
+
+      - name: Report on the optional step
+        run: echo "signing outcome=${{ steps.optional.outcome }} conclusion=${{ steps.optional.conclusion }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: ./dist
+
+      # This one really fails, which fails the job.
+      - name: Verify signature
+        run: |
+          echo "::error::signature verification failed"
+          exit 1
+
+      # ...but cleanup still runs, because of `if: always()`.
+      - name: Clean up
+        if: always()
+        run: echo "Removing temporary files"
+
+  publish:
+    name: Publish
+    needs: [package]
+    # No `if:` means an implicit `success()`, so a failed `package` skips this.
+    steps:
+      - name: Publish
+        run: echo "Publishing ${{ needs.version.outputs.version }}"
+
+  rollback:
+    name: Rollback
+    needs: [package]
+    if: failure()
+    steps:
+      - name: Roll back
+        run: |
+          echo "Rolling back (package result was ${{ needs.package.result }})"
+
+  notify:
+    name: Notify
+    needs: [publish, rollback]
+    if: always()
+    steps:
+      - name: Summarise
+        run: |
+          echo "publish:  ${{ needs.publish.result }}"
+          echo "rollback: ${{ needs.rollback.result }}"
+          echo "### Release ${{ needs.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,73 @@
+# Build matrices: one job definition, many runs.
+#
+#   minact run --file examples/matrix.yml --event push
+#
+# The `package` job below is the shape a cross-platform release takes — one
+# entry per artifact, with per-entry settings carried in the matrix itself.
+
+name: Matrix builds
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # The classic form: every combination of two axes.
+  test:
+    strategy:
+      matrix:
+        os: [linux, macos]
+        node: [18, 20]
+        # Drop a combination that is not worth running.
+        exclude:
+          - os: macos
+            node: 18
+        # Add a value to one existing combination, and one extra run that is
+        # not part of the product at all.
+        include:
+          - os: linux
+            node: 20
+            coverage: true
+          - os: windows
+            node: 20
+    steps:
+      - name: Show the combination
+        run: |
+          echo "os=${{ matrix.os }} node=${{ matrix.node }}"
+          echo "instance ${{ strategy.job-index }} of ${{ strategy.job-total }}"
+      - name: Collect coverage
+        if: matrix.coverage
+        run: echo "Collecting coverage for this combination only"
+
+  # Structured matrix values keep related settings together, which suits
+  # per-platform packaging better than parallel axes do.
+  package:
+    needs: [test]
+    strategy:
+      # Let every platform finish even if one fails, so you see all the
+      # breakage in one run instead of only the first.
+      fail-fast: false
+      matrix:
+        target:
+          - platform: android
+            format: apk
+          - platform: macos
+            format: dmg
+          - platform: linux
+            format: deb
+    steps:
+      - name: Package
+        run: |
+          echo "Packaging ${{ matrix.target.platform }} as ${{ matrix.target.format }}"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target.platform }}-${{ matrix.target.format }}
+          path: ./dist
+
+  # Dependents wait for every instance, and see one combined result.
+  release:
+    needs: [package]
+    steps:
+      - name: Release
+        run: echo "All packages built - package result was ${{ needs.package.result }}"

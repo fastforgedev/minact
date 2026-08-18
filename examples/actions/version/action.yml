@@ -1,0 +1,19 @@
+name: Version
+description: Builds a version string from its inputs
+inputs:
+  major:
+    description: Major version
+    required: true
+    default: "1"
+outputs:
+  full:
+    description: The assembled version
+    value: ${{ steps.assemble.outputs.value }}
+runs:
+  using: composite
+  steps:
+    - id: assemble
+      shell: bash
+      run: echo "value=${{ inputs.major }}.$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+    - shell: bash
+      run: echo "assembled ${{ steps.assemble.outputs.value }}"

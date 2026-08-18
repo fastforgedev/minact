@@ -1,0 +1,54 @@
+# Actions referenced with `uses:`.
+#
+# Run it with:
+#   minact run --file examples/actions.yml
+#
+# The remote steps fetch from GitHub the first time and are served from
+# ~/.minact/actions after that. The JavaScript ones need `node` on your PATH
+# and the container one needs a Docker daemon.
+name: Actions
+on: workflow_dispatch
+
+jobs:
+  builtin:
+    name: Built-in
+    steps:
+      # Ships with minact: no fetch, no node, no container.
+      - uses: actions/checkout@v4
+
+  remote:
+    name: From GitHub
+    needs: [builtin]
+    steps:
+      # A tag, the usual way to pin.
+      - id: greet
+        uses: actions/hello-world-javascript-action@main
+        with:
+          who-to-greet: minact
+      - run: echo "the action reported ${{ steps.greet.outputs.time }}"
+
+      # A commit SHA also works, and is what you want for anything that
+      # matters. So does `owner/repo/sub/directory@ref`.
+      # - uses: actions/hello-world-javascript-action@79ac0da13ee392da3fdd151813d5ce4658cb7e27
+
+  local:
+    name: From this repository
+    needs: [builtin]
+    steps:
+      # A composite action next to the workflow. `./` paths are relative to
+      # the workspace root and cannot climb out of it.
+      - id: version
+        uses: ./examples/actions/version
+        with:
+          major: "2"
+      - run: echo "composite said ${{ steps.version.outputs.full }}"
+
+  container:
+    name: In a container
+    needs: [builtin]
+    steps:
+      # An image run as-is: `entrypoint` and `args` come from `with:`.
+      - uses: docker://alpine:3.20
+        with:
+          entrypoint: /bin/sh
+          args: -c "echo running on $(uname -s)"
