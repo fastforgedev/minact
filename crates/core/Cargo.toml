@@ -25,3 +25,10 @@ dirs = { workspace = true }
 # Cancelling a step has to reach the processes the step spawned, which means
 # signalling the process group rather than just the shell.
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = "0.1"
+tempfile = { workspace = true }
