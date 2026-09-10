@@ -25,7 +25,7 @@ function ArtifactsScreen() {
         </h1>
         <p className="text-muted-foreground text-sm">
           What <code className="font-mono">actions/upload-artifact</code> left
-          in <code className="font-mono">.minact-artifacts/</code>. Artifacts
+          in <code className="font-mono">.minact/artifacts/</code>. Artifacts
           are keyed by name, so a second run with the same name replaces the
           first.
         </p>

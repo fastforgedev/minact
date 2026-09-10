@@ -86,6 +86,13 @@ pub enum RunnerSpec {
         sync: bool,
         #[serde(default, rename = "ssh-args")]
         ssh_args: Vec<String>,
+        /// The program on the remote that runs minact's scripts, fed on stdin.
+        /// Detected when unset: `sh`, or Git for Windows' `bash.exe`.
+        #[serde(default)]
+        shell: Option<String>,
+        /// Patterns left out of the workspace sync, in both directions.
+        #[serde(default)]
+        exclude: Vec<String>,
     },
 }
 
@@ -154,6 +161,8 @@ impl RunnerSpec {
                 remote_workspace,
                 sync,
                 ssh_args,
+                shell,
+                exclude,
             } => Arc::new(SshExecutor::new(
                 SshConfig {
                     host: host.clone(),
@@ -163,8 +172,11 @@ impl RunnerSpec {
                     remote_workspace: remote_workspace.clone(),
                     sync: *sync,
                     ssh_args: ssh_args.clone(),
+                    shell: shell.clone(),
+                    exclude: exclude.clone(),
                 },
                 workspace.to_path_buf(),
+                runner_temp.to_path_buf(),
             )),
         })
     }

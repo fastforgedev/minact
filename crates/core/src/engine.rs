@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::{self, ParsedCommand};
 use crate::config::{Config, RunnerSpec};
 use crate::executor::{Executor, OutputSink, StepRequest};
+use crate::layout::WorkDir;
 use crate::logging::{
     CommandStream, EventScope, LogEvent, LogLevel, LogRecord, Reporter, TracingReporter,
 };
@@ -32,11 +33,6 @@ use crate::actions::{
 };
 use crate::expr;
 use crate::scheduler::JobScheduler;
-
-#[cfg(windows)]
-const PATH_SEPARATOR: &str = ";";
-#[cfg(not(windows))]
-const PATH_SEPARATOR: &str = ":";
 
 /// Per-run plumbing threaded through execution.
 ///
@@ -119,42 +115,29 @@ pub struct Engine {
     config: Config,
     /// Current workspace directory.
     workspace: PathBuf,
+    /// The runner's own directory tree, `.minact/_work` by default: where
+    /// `$RUNNER_TEMP` and `$RUNNER_TOOL_CACHE` live.
+    work: WorkDir,
     /// Receives structured execution log events.
     reporter: Arc<dyn Reporter>,
+    /// Only these jobs (and what they `need`) run, when set.
+    jobs: Option<Vec<String>>,
 }
 
 impl Engine {
     /// Create a new engine with the given workspace.
     pub fn new(workspace: PathBuf) -> Self {
-        Self {
-            actions: ActionRegistry::new(),
-            store: default_action_store(),
-            config: Config::default(),
-            workspace,
-            reporter: Arc::new(TracingReporter),
-        }
+        Self::with_actions_and_reporter(workspace, ActionRegistry::new(), Arc::new(TracingReporter))
     }
 
     /// Create a new engine with a custom action registry.
     pub fn with_actions(workspace: PathBuf, actions: ActionRegistry) -> Self {
-        Self {
-            actions,
-            store: default_action_store(),
-            config: Config::default(),
-            workspace,
-            reporter: Arc::new(TracingReporter),
-        }
+        Self::with_actions_and_reporter(workspace, actions, Arc::new(TracingReporter))
     }
 
     /// Create a new engine with a custom reporter.
     pub fn with_reporter(workspace: PathBuf, reporter: Arc<dyn Reporter>) -> Self {
-        Self {
-            actions: ActionRegistry::new(),
-            store: default_action_store(),
-            config: Config::default(),
-            workspace,
-            reporter,
-        }
+        Self::with_actions_and_reporter(workspace, ActionRegistry::new(), reporter)
     }
 
     /// Create a new engine with a custom action registry and reporter.
@@ -163,13 +146,33 @@ impl Engine {
         actions: ActionRegistry,
         reporter: Arc<dyn Reporter>,
     ) -> Self {
+        let work = WorkDir::for_workspace(&workspace);
         Self {
             actions,
             store: default_action_store(),
             config: Config::default(),
             workspace,
+            work,
             reporter,
+            jobs: None,
         }
+    }
+
+    /// Keep the runner's own files — job scratch space, the tool cache —
+    /// somewhere other than `<workspace>/.minact/_work`.
+    ///
+    /// The tree is normally inside the workspace so that a job container
+    /// reaches it through the workspace mount. Putting it elsewhere is for an
+    /// embedder that owns the project directory and does not want anything
+    /// written into it.
+    pub fn with_work_dir(mut self, root: PathBuf) -> Self {
+        self.work = WorkDir::at(root);
+        self
+    }
+
+    /// Where the runner keeps its own files for this workspace.
+    pub fn work_dir(&self) -> &WorkDir {
+        &self.work
     }
 
     /// Register a custom action.
@@ -193,6 +196,13 @@ impl Engine {
     /// different platform is reported rather than silently ignored.
     pub fn with_config(mut self, config: Config) -> Self {
         self.config = config;
+        self
+    }
+
+    /// Run only these jobs, plus whatever they `need`. Everything else is
+    /// left out of the plan entirely rather than reported as skipped.
+    pub fn with_jobs(mut self, jobs: Vec<String>) -> Self {
+        self.jobs = if jobs.is_empty() { None } else { Some(jobs) };
         self
     }
 
@@ -233,10 +243,9 @@ impl Engine {
                 message: format!("runner: {}", spec.describe()),
             })
             .await;
-            let runner_temp = std::env::temp_dir().join("minact");
             let executor = spec.build(
                 &self.workspace,
-                &runner_temp,
+                Path::new(&ctx.runner.temp),
                 &[self.store.root().to_path_buf()],
             )?;
             return Ok((executor, spec));
@@ -278,12 +287,12 @@ impl Engine {
             .await;
         }
 
-        let runner_temp = std::env::temp_dir().join("minact");
         // The action cache is mounted into job containers whether or not this
         // job uses it: a container's mounts are fixed before its first step.
+        // `$RUNNER_TEMP` needs no mount of its own: it is under the workspace.
         let executor = spec.build(
             &self.workspace,
-            &runner_temp,
+            Path::new(&ctx.runner.temp),
             &[self.store.root().to_path_buf()],
         )?;
         Ok((executor, spec))
@@ -314,6 +323,10 @@ impl Engine {
     ) -> Result<EngineResult, WorkflowError> {
         let run = Run::new(Arc::clone(&self.reporter), cancel);
 
+        // The runner's own tree has to exist before the first job asks for
+        // scratch space, and a previous run's leftovers go now.
+        self.work.prepare()?;
+
         run.emit(LogEvent::WorkflowStarted {
             workflow_name: workflow.name.clone(),
             event_name: event_name.to_string(),
@@ -325,7 +338,14 @@ impl Engine {
 
         // Resolve job execution order
         let scheduler = JobScheduler::new(workflow);
-        let layers = scheduler.resolve_parallel_layers()?;
+        let mut layers = scheduler.resolve_parallel_layers()?;
+        if let Some(selected) = &self.jobs {
+            let wanted = jobs_with_needs(workflow, selected)?;
+            for layer in &mut layers {
+                layer.retain(|job_id| wanted.contains(job_id));
+            }
+            layers.retain(|layer| !layer.is_empty());
+        }
 
         run.emit(LogEvent::ExecutionPlan {
             layers: layers.clone(),
@@ -552,8 +572,24 @@ impl Engine {
         // `env` and the `steps` context are job-scoped in GitHub Actions, so
         // snapshot them and restore once the job is done.
         let saved_env = ctx.env.clone();
+        // `runner.os` too: a job on another platform reports that platform.
+        let saved_runner = ctx.runner.clone();
         let saved_step_outputs = std::mem::take(&mut ctx.step_outputs);
         let saved_step_status = std::mem::take(&mut ctx.step_status);
+
+        // `$RUNNER_TEMP` is the job's: a fresh directory under
+        // `.minact/_work/_temp`, gone when the job is — the guard lives to
+        // the end of this function, whichever way the job ends.
+        let job_temp = self.work.job_temp(&instance.instance_id)?;
+        ctx.runner.temp = job_temp.path().to_string_lossy().to_string();
+
+        // `$GITHUB_EVENT_PATH` always names a file, as it does on GitHub: the
+        // payload this run was given, or the empty one it was not, written
+        // where the runner keeps it — `_github_workflow/event.json` under the
+        // job's scratch space. An executor that runs steps elsewhere carries
+        // the directory over before the first step.
+        let saved_event_path = ctx.github.event_path.clone();
+        ctx.github.event_path = write_event_payload(job_temp.path(), &ctx.github.event)?;
 
         // A job-level `timeout-minutes` bounds every step of it at once.
         let deadline = job
@@ -588,8 +624,11 @@ impl Engine {
         drop(deadline);
 
         ctx.env = saved_env;
+        ctx.runner = saved_runner;
+        ctx.github.event_path = saved_event_path;
         ctx.step_outputs = saved_step_outputs;
         ctx.step_status = saved_step_status;
+        drop(job_temp);
 
         result
     }
@@ -678,6 +717,35 @@ impl Engine {
             return Ok(JobResult {
                 ..instance.result_with(StepConclusion::Failure)
             });
+        }
+
+        // A job that runs elsewhere reports that platform: `runs-on:
+        // windows-latest` mapped to a Windows host has `runner.os == Windows`
+        // and `RUNNER_OS=Windows`, whatever this machine is.
+        if let Some(platform) = executor.platform() {
+            ctx.runner.os = platform.os;
+            if let Some(arch) = platform.arch {
+                ctx.runner.arch = arch;
+            }
+        }
+
+        // The event payload has to be where the steps are. Local and Docker
+        // answer with the same path; SSH copies the directory over.
+        let workflow_dir = Path::new(&ctx.runner.temp).join(WORKFLOW_DIR);
+        match executor
+            .provision_dir(&workflow_dir, &StepSink::new(run.clone(), Vec::new()))
+            .await
+        {
+            Ok(remote) => {
+                ctx.github.event_path = remote.join(EVENT_FILE).to_string_lossy().to_string();
+            }
+            Err(e) => {
+                run.emit(LogEvent::Message {
+                    level: LogLevel::Warn,
+                    message: format!("could not provide the event payload to the runner: {}", e),
+                })
+                .await;
+            }
         }
 
         let mut step_results = Vec::new();
@@ -1091,7 +1159,7 @@ impl Engine {
                 .shell
                 .clone()
                 .or_else(|| defaults.shell.clone())
-                .unwrap_or_else(|| "bash".to_string());
+                .unwrap_or_else(|| crate::executor::DEFAULT_SHELL.to_string());
             self.execute_shell_step(
                 script_source,
                 step_name,
@@ -1151,6 +1219,7 @@ impl Engine {
                     job_id,
                     ctx,
                     run,
+                    executor,
                 )
                 .await;
         }
@@ -1188,7 +1257,22 @@ impl Engine {
             .await;
             with.insert(key.clone(), resolved_value);
         }
-        let inputs = actions::action_inputs(&resolved.manifest, &with);
+        let mut inputs = actions::action_inputs(&resolved.manifest, &with);
+        // A declared default can be an expression — `${{ runner.arch }}` is
+        // a common one — and is evaluated where the action is used, the same
+        // as a `with:` value. Explicit values were evaluated above already.
+        for (name, value) in inputs.values.iter_mut() {
+            if with.contains_key(name) || !value.contains("${{") {
+                continue;
+            }
+            let resolved_value =
+                evaluate_at(&format!("{} inputs.{} default", uses, name), value, ctx)?;
+            inputs.env.insert(
+                actions::external::input_var_name(name),
+                resolved_value.clone(),
+            );
+            *value = resolved_value;
+        }
         for warning in &inputs.warnings {
             run.emit(LogEvent::Message {
                 level: LogLevel::Warn,
@@ -1317,6 +1401,7 @@ impl Engine {
         job_id: &str,
         ctx: &Context,
         run: &Run,
+        executor: &dyn Executor,
     ) -> Result<StepExecution, WorkflowError> {
         let action_name = actions::registry_name(uses);
         let action = self
@@ -1364,8 +1449,32 @@ impl Engine {
             .validate(&action_ctx)
             .map_err(|e| WorkflowError::StepFailed(step_name.to_string(), e.to_string()))?;
 
-        // Run the action
-        match action.run(&action_ctx).await {
+        // The action works on the host workspace. When the job's steps run
+        // elsewhere, what they produced has to come across first — so that
+        // `upload-artifact` sees a build made on a remote host — and what the
+        // action leaves behind has to go back, so that a restored cache is
+        // there for the next step.
+        let sink = StepSink::new(run.clone(), masks.to_vec());
+        if let Err(e) = executor.sync_back(&sink).await {
+            run.emit(LogEvent::ActionError {
+                message: e.to_string(),
+            })
+            .await;
+            return Ok(StepExecution::failed());
+        }
+        let since = std::time::SystemTime::now();
+
+        let outcome = action.run(&action_ctx).await;
+
+        if let Err(e) = executor.sync_forward(since, &sink).await {
+            run.emit(LogEvent::ActionError {
+                message: e.to_string(),
+            })
+            .await;
+            return Ok(StepExecution::failed());
+        }
+
+        match outcome {
             Ok(output) => {
                 run.emit(LogEvent::ActionFinished {
                     success: output.success,
@@ -1507,7 +1616,7 @@ impl Engine {
             .map(|wd| self.resolve_dir(wd))
             .unwrap_or_else(|| self.workspace.clone());
 
-        let mut env = self.build_process_env(ctx, job_id, step_env, extra_paths);
+        let mut env = self.build_process_env(ctx, job_id, step_env);
         env.extend(inputs.env.clone());
         env.extend(
             state
@@ -1534,6 +1643,8 @@ impl Engine {
             shell: "node".to_string(),
             working_directory: working_dir,
             env,
+            extra_paths: extra_paths.to_vec(),
+            node: node_major(&resolved.manifest.runs),
             runner_temp: PathBuf::from(&ctx.runner.temp),
             command: Some(command),
         };
@@ -1998,14 +2109,14 @@ impl Engine {
             .map(|wd| self.resolve_dir(wd))
             .unwrap_or_else(|| self.workspace.clone());
 
-        let env = self.build_process_env(ctx, job_id, step_env, extra_paths);
+        let env = self.build_process_env(ctx, job_id, step_env);
 
         // The command is echoed before it runs, so it has to be redacted the
         // same way its output is — a masked secret that leaks in the echo has
         // not been masked.
         run.emit(LogEvent::CommandStarted {
             command: commands::apply_masks(&resolved_run, masks),
-            shell: shell.to_string(),
+            shell: crate::executor::display_shell(shell).to_string(),
             working_dir: working_dir.display().to_string(),
         })
         .await;
@@ -2016,6 +2127,8 @@ impl Engine {
             shell: shell.to_string(),
             working_directory: working_dir,
             env,
+            extra_paths: extra_paths.to_vec(),
+            node: None,
             runner_temp: PathBuf::from(&ctx.runner.temp),
             command: None,
         };
@@ -2132,6 +2245,19 @@ impl Engine {
         let mut env = HashMap::new();
         env.insert("CI".to_string(), "true".to_string());
         env.insert("GITHUB_ACTIONS".to_string(), "true".to_string());
+        // Inside an action, where it is and what it is: a composite's `run:`
+        // steps reach their own files through `$GITHUB_ACTION_PATH`. Unset
+        // outside one, as on GitHub.
+        for (name, value) in [
+            ("GITHUB_ACTION", &ctx.github.action),
+            ("GITHUB_ACTION_PATH", &ctx.github.action_path),
+            ("GITHUB_ACTION_REPOSITORY", &ctx.github.action_repository),
+            ("GITHUB_ACTION_REF", &ctx.github.action_ref),
+        ] {
+            if !value.is_empty() {
+                env.insert(name.to_string(), value.clone());
+            }
+        }
         env.insert("GITHUB_WORKSPACE".to_string(), ctx.github.workspace.clone());
         env.insert(
             "GITHUB_REPOSITORY".to_string(),
@@ -2214,23 +2340,13 @@ impl Engine {
         ctx: &Context,
         job_id: &str,
         step_env: &HashMap<String, String>,
-        extra_paths: &[String],
     ) -> HashMap<String, String> {
-        let mut env: HashMap<String, String> = std::env::vars().collect();
-        env.extend(self.standard_env(ctx, job_id));
+        // Only what the workflow and the engine set. The executor decides
+        // whether this machine's environment goes underneath: the local one
+        // does, a remote host must keep its own.
+        let mut env = self.standard_env(ctx, job_id);
         env.extend(ctx.env.clone());
         env.extend(step_env.clone());
-
-        if !extra_paths.is_empty() {
-            let mut parts: Vec<String> = extra_paths.to_vec();
-            if let Some(current) = env.get("PATH") {
-                if !current.is_empty() {
-                    parts.push(current.clone());
-                }
-            }
-            env.insert("PATH".to_string(), parts.join(PATH_SEPARATOR));
-        }
-
         env
     }
 
@@ -2241,11 +2357,10 @@ impl Engine {
         event_name: &str,
         inputs: HashMap<String, String>,
     ) -> Context {
-        let temp = std::env::temp_dir().join("minact");
-        std::fs::create_dir_all(&temp).ok();
-        let tool_cache = dirs::cache_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("minact-tools");
+        // Every job replaces `temp` with a directory of its own before a step
+        // sees it; the tree's `_temp` is what stands in until then.
+        let temp = self.work.temp();
+        let tool_cache = self.work.tool_cache();
 
         // `workflow_dispatch` inputs fall back to their declared defaults.
         let mut resolved_inputs = HashMap::new();
@@ -2629,6 +2744,27 @@ fn ref_type(git_ref: &str) -> String {
     }
 }
 
+/// Where the event payload lives under a job's scratch directory, and what
+/// it is called — the same names GitHub's runner uses.
+const WORKFLOW_DIR: &str = "_github_workflow";
+const EVENT_FILE: &str = "event.json";
+
+/// Write the payload to `<job_temp>/_github_workflow/event.json` and return
+/// the path. An empty payload is written as `{}`, which is what an action
+/// reading the file expects of an event with nothing in it.
+fn write_event_payload(
+    job_temp: &Path,
+    event: &HashMap<String, serde_json::Value>,
+) -> Result<String, WorkflowError> {
+    let dir = job_temp.join(WORKFLOW_DIR);
+    std::fs::create_dir_all(&dir)?;
+    let file = dir.join(EVENT_FILE);
+    let payload = serde_json::to_string_pretty(event)
+        .map_err(|e| WorkflowError::Other(format!("cannot serialise the event payload: {}", e)))?;
+    std::fs::write(&file, payload)?;
+    Ok(file.to_string_lossy().to_string())
+}
+
 /// Read the event payload named by `GITHUB_EVENT_PATH`, if there is one.
 ///
 /// Returns the path alongside the payload so `github.event_path` can point at
@@ -2798,6 +2934,48 @@ fn evaluate_at(what: &str, source: &str, ctx: &Context) -> Result<String, Workfl
 ///
 /// Only used to decide whether the fallback is worth warning about — running
 /// a `macos-latest` job on a Mac needs no explanation.
+/// The selected jobs and, transitively, everything they `need`.
+fn jobs_with_needs(
+    workflow: &Workflow,
+    selected: &[String],
+) -> Result<std::collections::HashSet<String>, WorkflowError> {
+    let mut wanted = std::collections::HashSet::new();
+    let mut pending: Vec<String> = Vec::new();
+    for job_id in selected {
+        if !workflow.jobs.contains_key(job_id) {
+            let mut known: Vec<&String> = workflow.jobs.keys().collect();
+            known.sort();
+            return Err(WorkflowError::Other(format!(
+                "no job named '{}' in this workflow (jobs: {})",
+                job_id,
+                known
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        pending.push(job_id.clone());
+    }
+    while let Some(job_id) = pending.pop() {
+        if !wanted.insert(job_id.clone()) {
+            continue;
+        }
+        if let Some(job) = workflow.jobs.get(&job_id) {
+            pending.extend(job.needs.iter().flatten().cloned());
+        }
+    }
+    Ok(wanted)
+}
+
+/// The Node major a JavaScript action declared: `using: node20` is 20.
+fn node_major(runs: &ActionRuns) -> Option<u32> {
+    match runs {
+        ActionRuns::Node { using, .. } => using.strip_prefix("node")?.parse().ok(),
+        _ => None,
+    }
+}
+
 fn host_matches(label: &str) -> bool {
     let label = label.to_ascii_lowercase();
     if label.contains("self-hosted") {

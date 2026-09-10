@@ -118,6 +118,28 @@ run of a workflow fetches nothing. A clone lands in a staging directory and is
 renamed into place, so an interrupted fetch cannot leave a half-populated entry
 behind, and two jobs racing for the same action are fine.
 
+### The runner's own files: `.minact/_work`
+
+Everything minact needs at run time hangs off one directory inside the
+project, the way GitHub's runner keeps its `_work`:
+
+```text
+.minact/_work/
+├── .gitignore          # `*` — the tree ignores itself
+├── _temp/              # scratch space
+│   └── <job>-xxxxxx/   # one job's $RUNNER_TEMP; removed when the job ends
+└── _tool/              # $RUNNER_TOOL_CACHE, unless that variable is set
+```
+
+Keeping it under the workspace is what lets a job container reach it without a
+mount of its own: the workspace is bind-mounted at the same path on both sides,
+so `$RUNNER_TEMP` means the same thing inside. A sync to an SSH runner leaves
+the tree out in both directions. A job's scratch directory carries a random
+suffix because two runs can share a workspace — Studio starts one per
+request — and a leftover from a run that was killed is swept the next time a
+run starts. An embedder that does not want anything written into the project
+moves the tree with `Engine::with_work_dir`.
+
 Fetching shells out to `git`, which means your existing credential setup
 already applies to private actions. `MINACT_ACTIONS_TOKEN` — or `GITHUB_TOKEN`
 — is also honoured, passed through a mode-`0600` credential file rather than on
@@ -134,16 +156,35 @@ Actions follow their job. With the **local** runner they run here. With
 **docker** they run inside the job's container, which is why the action cache
 is bind-mounted into it — so `runs-on: ubuntu-latest` with a JavaScript action
 really runs that action on Linux, provided the image has `node`. With **ssh**
-the action directory is copied to the remote host with `rsync` before it runs,
-once per job rather than once per step.
+the action directory is copied to the remote host before it runs, once per job
+rather than once per step.
 
 Two things do not follow the job, and both are deliberate:
 
-* Registered actions run in-process on the host, as they always have.
+* Registered actions run in-process on the host, as they always have. On a
+  remote runner the workspace is reconciled around each one — what the
+  remote steps produced comes back first, so `actions/upload-artifact` sees
+  the build; what the action left behind goes over afterwards. Both
+  directions are incremental.
 * A **container action** runs on the host's Docker even when the job is on a
   remote host, with the host's workspace mounted. Over SSH that is the local
-  copy, reconciled when the workspace syncs back at the end of the job — the
-  same caveat the built-ins carry.
+  copy, reconciled only when the workspace syncs back at the end of the job.
+
+A JavaScript action needs `node`. Locally and in a container that means the
+`node` that is there. On an **ssh** runner without one, minact installs the
+official build of the major the action declared (`using: node20`) into the
+remote's tool cache, checksum-verified and kept for next time — the way
+GitHub's runners carry their own. It is laid out the way `actions/toolkit`
+lays out a tool cache (`node/<version>/<arch>/` plus a `.complete` marker), so
+a later `actions/setup-node` step finds it instead of downloading again, and
+the other way round. `MINACT_NODE_MIRROR` points at a mirror laid out like
+`nodejs.org/dist`.
+
+The remote keeps minact's files where the host does: `.minact/_work` under
+the remote workspace, with `_temp` for scripts and step files, `_tool` for the
+tool cache and `_actions` for actions copied over. A host path maps to a
+remote one by swapping the workspace prefix, and the sync leaves the tree out
+in both directions.
 
 ## Execution Model
 
@@ -154,6 +195,8 @@ minact aims to match GitHub Actions semantics. The details worth knowing:
 `CI`, `GITHUB_ACTIONS`, `GITHUB_WORKSPACE`, `GITHUB_REPOSITORY`, `GITHUB_REF`,
 `GITHUB_REF_NAME`, `GITHUB_SHA`, `GITHUB_ACTOR`, `GITHUB_EVENT_NAME`,
 `GITHUB_JOB`, `RUNNER_OS`, `RUNNER_ARCH`, `RUNNER_TEMP`, `RUNNER_TOOL_CACHE`.
+`RUNNER_TEMP` is a directory of the job's own under `.minact/_work/_temp`,
+gone when the job ends; `RUNNER_TOOL_CACHE` is `.minact/_work/_tool`.
 Workflow `env` is layered under job `env`, which is layered under step `env`.
 Job-level `env` does not leak into the next job.
 
@@ -233,7 +276,8 @@ runners:
     type: ssh
     host: win-builder.local
     user: builder
-    remote-workspace: C:/minact/workspace
+    remote-workspace: ~/minact-workspace
+    exclude: [target, .git]
 ```
 
 See [examples/config.yml](examples/config.yml) for every option. Pass a
@@ -247,13 +291,29 @@ bind-mounted at *identical paths* inside the container, so `GITHUB_WORKSPACE`,
 `working-directory` and the `$GITHUB_*` files need no translation and files the
 container writes appear in your workspace. One container per job, kept alive
 across its steps so `$GITHUB_ENV` and `$GITHUB_PATH` carry over, and removed
-when the job ends. Set `pull: true` to fetch the image, `run-args` for things
+when the job ends. Inside the job `runner.os` and `RUNNER_OS` are `Linux`. Set `pull: true` to fetch the image, `run-args` for things
 like `--platform linux/amd64`, and `binary: podman` to use a compatible CLI.
 
 **ssh** — another machine, for what a container cannot provide: Windows, or
-real macOS hardware for signing. The workspace is pushed with `rsync` before
-the job and pulled back afterwards (`sync: false` if the remote manages its own
-checkout). Requires key-based login that already works non-interactively.
+real macOS hardware for signing. The workspace is pushed before the job and
+pulled back afterwards (`sync: false` if the remote manages its own
+checkout) — with `rsync` when both ends have it, and as a `tar` stream
+otherwise, in which case only the files the job touched come back. `exclude:`
+keeps things like `target/` and `.git/` out of the transfer in both
+directions. Requires key-based login that already works non-interactively;
+nothing has to be installed on a Unix remote. The job reports the remote's
+platform: `runner.os` and `RUNNER_OS` are what the remote is, not what this
+machine is.
+
+A **Windows** remote needs only OpenSSH Server and Git for Windows. minact
+recognises the `cmd.exe` (or PowerShell) login shell and drives the machine
+through Git Bash, found next to `git.exe` — or named with `shell:` when it is
+somewhere else. The job then looks like one of GitHub's Windows runners:
+`runner.os` is `Windows`, `shell: bash` is Git Bash, `shell: pwsh` falls back
+to Windows PowerShell 5.1 when PowerShell 7 is not installed, and
+`$GITHUB_OUTPUT` written by PowerShell's `>>` (which is UTF-16) is read
+correctly. `remote-workspace` can be `~/minact-workspace` or a `C:/...` path.
+[examples/windows.yml](examples/windows.yml) is a worked example.
 
 `runs-on` is evaluated as an expression, so one job definition can land on a
 different runner per matrix instance:
@@ -300,12 +360,18 @@ needs a database will tell you it did not get one.
 
 * Built-in actions (`actions/checkout`, `actions/upload-artifact`) run
   in-process on the host. With Docker that is fine — the workspace is the same
-  filesystem. Over SSH they act on the *local* copy, which is only reconciled
-  when the workspace syncs back at the end of the job. Container actions carry
-  the same caveat; see [Actions](#where-an-action-runs).
-* A JavaScript action needs `node` wherever it runs. A container image without
-  one — `ubuntu:24.04`, say — will fail the step rather than the run.
-* `docker` needs a running daemon; `ssh` needs `ssh` and `rsync` on your PATH.
+  filesystem. Over SSH the workspace is synced around them, so they see what
+  the remote built; container actions are not, and see the local copy. See
+  [Actions](#where-an-action-runs).
+* A JavaScript action needs `node`. A container image without one —
+  `ubuntu:24.04`, say — will fail the step rather than the run; an SSH host
+  without one gets a copy installed.
+* `docker` needs a running daemon; `ssh` needs `ssh` and `tar` on your PATH,
+  and uses `rsync` when both ends have it.
+* The workspace is your working tree, not a fresh checkout: a step that does
+  `mkdir build` fails the second time, and `cargo fmt --check` sees your
+  uncommitted edits. Run from a clean clone (`git worktree add`) when that
+  matters.
 * Cancelling a container step kills the container. Cancelling an SSH step
   closes the connection, which hangs up the remote shell but cannot guarantee
   its grandchildren die.
@@ -411,6 +477,12 @@ minact run --event push
 # Pass input parameters
 minact run --input version=1.0.0
 
+# Run another project's workflow, from that project's directory
+minact run --workspace ../my-app --event push
+
+# Only some jobs — the ones named, plus whatever they `need`
+minact run --file .github/workflows/build.yml --job build-macos --job build-ios
+
 # Emit structured JSON log events
 minact run --log-format json
 
@@ -502,7 +574,7 @@ Runs are recorded under `.minact/runs/<n>/` as `meta.json` plus an
 Studio and any run can be replayed. The run list filters by workflow and
 status, a run downloads as a plain-text log, and the Artifacts screen browses,
 previews and downloads whatever `actions/upload-artifact` left in
-`.minact-artifacts/`.
+`.minact/artifacts/`.
 
 It binds to loopback by default. Studio can run workflows, which means running
 shell commands on this machine, so binding it to a reachable address hands a
@@ -550,6 +622,7 @@ minact/
 │   │   │   ├── scheduler.rs # Job DAG scheduler
 │   │   │   ├── matrix.rs    # strategy.matrix expansion
 │   │   │   ├── config.rs    # .minact/config.yml, runs-on -> runner mapping
+│   │   │   ├── layout.rs    # .minact/_work: $RUNNER_TEMP and the tool cache
 │   │   │   ├── executor/    # where steps run: local, docker, ssh
 │   │   │   ├── commands.rs  # $GITHUB_OUTPUT and `::` workflow commands
 │   │   │   ├── logging.rs   # Structured log events & the Reporter trait

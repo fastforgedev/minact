@@ -698,6 +698,74 @@ pub fn evaluate_string(input: &str, ctx: &Context) -> Result<String, WorkflowErr
     Ok(result)
 }
 
+/// The files under `workspace` that `pattern` matches, sorted.
+///
+/// Patterns are relative to the workspace; an absolute one is its own. `*`
+/// stays within one path component and `**` spans directories, as on GitHub.
+///
+/// This walks the tree itself rather than asking `glob::glob`, which follows
+/// symbolic links: a Flutter project's `.dart_tool/.plugin_symlinks` points
+/// back into the project, and `**` went round that loop for as long as it was
+/// allowed to. Symlinked directories are not descended into; a symlink to a
+/// file still counts.
+pub(crate) fn glob_files(workspace: &std::path::Path, pattern: &str) -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+
+    let joined = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        workspace.join(pattern)
+    };
+    let Ok(matcher) = glob::Pattern::new(&joined.to_string_lossy()) else {
+        return Vec::new();
+    };
+    let options = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: true,
+        require_literal_leading_dot: false,
+    };
+
+    // Start at the deepest directory the pattern names literally.
+    let mut base = PathBuf::new();
+    for component in joined.components() {
+        if component
+            .as_os_str()
+            .to_string_lossy()
+            .contains(['*', '?', '['])
+        {
+            break;
+        }
+        base.push(component.as_os_str());
+    }
+
+    let mut found = Vec::new();
+    let mut pending = vec![base];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            // Not a directory: the pattern named a file outright.
+            if dir.is_file() && matcher.matches_path_with(&dir, options) {
+                found.push(dir);
+            }
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(path);
+            } else if (kind.is_file() || (kind.is_symlink() && path.is_file()))
+                && matcher.matches_path_with(&path, options)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// Hash the set of files matching any of `patterns`, relative to `workspace`.
 ///
 /// GitHub's definition: a SHA-256 per matched file, then a SHA-256 over those
@@ -709,17 +777,8 @@ pub fn hash_files(workspace: &std::path::Path, patterns: &[String]) -> String {
 
     let mut matched: Vec<std::path::PathBuf> = Vec::new();
     for pattern in patterns {
-        // Patterns are relative to the workspace; an absolute one is its own.
-        let joined = if std::path::Path::new(pattern).is_absolute() {
-            pattern.clone()
-        } else {
-            workspace.join(pattern).to_string_lossy().to_string()
-        };
-        let Ok(entries) = glob::glob(&joined) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.is_file() && !matched.contains(&entry) {
+        for entry in glob_files(workspace, pattern) {
+            if !matched.contains(&entry) {
                 matched.push(entry);
             }
         }
@@ -1691,6 +1750,27 @@ mod tests {
         // got wrong, and it silently made every cache key identical.
         std::fs::write(dir.path().join("Cargo.lock"), "lock v2").unwrap();
         assert_ne!(first, hash_files(dir.path(), &patterns));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_files_survives_a_symlink_loop_and_ignores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pkg/.dart_tool")).unwrap();
+        std::fs::write(dir.path().join("pkg/pubspec.lock"), "lock").unwrap();
+        // What a Flutter checkout looks like: a link back up the tree.
+        std::os::unix::fs::symlink(
+            dir.path().join("pkg"),
+            dir.path().join("pkg/.dart_tool/self"),
+        )
+        .unwrap();
+
+        let found = glob_files(dir.path(), "**/pubspec.lock");
+        assert_eq!(found, vec![dir.path().join("pkg/pubspec.lock")]);
+        assert_eq!(
+            hash_files(dir.path(), &["**/pubspec.lock".to_string()]).len(),
+            64
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Browsing what `actions/upload-artifact` left behind.
 //!
-//! Artifacts land in `<workspace>/.minact-artifacts/<name>/`, keyed by name
+//! Artifacts land in `<workspace>/.minact/artifacts/<name>/`, keyed by name
 //! rather than by run — uploading the same name twice overwrites, exactly as
 //! the action behaves. So this is the current contents of that directory, not
 //! a per-run archive.
@@ -11,7 +11,8 @@ use serde::Serialize;
 
 use crate::error::ApiError;
 
-pub const DIRECTORY: &str = ".minact-artifacts";
+/// Where the engine's `upload-artifact` puts things, relative to the workspace.
+pub const DIRECTORY: &str = minact_core::ARTIFACTS_DIR;
 
 #[derive(Debug, Serialize)]
 pub struct ArtifactDto {

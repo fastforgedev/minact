@@ -73,7 +73,13 @@ impl From<MatrixCombination> for std::collections::HashMap<String, Value> {
 /// Always returns at least one combination; a matrix that expands to nothing
 /// yields a single empty combination so the job still runs once.
 pub fn expand(config: &MatrixConfig) -> Vec<MatrixCombination> {
-    let mut combinations = cartesian_product(config);
+    // With no axes there is nothing to take a product of — and no empty
+    // placeholder for `include` entries to fold into, either.
+    let mut combinations = if config.axes.is_empty() {
+        Vec::new()
+    } else {
+        cartesian_product(config)
+    };
     combinations.retain(|combination| !is_excluded(combination, config));
     apply_includes(&mut combinations, config);
 
@@ -122,11 +128,16 @@ fn is_excluded(combination: &MatrixCombination, config: &MatrixConfig) -> bool {
 /// compatible with none, it becomes a combination of its own.
 fn apply_includes(combinations: &mut Vec<MatrixCombination>, config: &MatrixConfig) {
     let axis_names: Vec<&str> = config.axes.iter().map(|axis| axis.name.as_str()).collect();
+    // Entries merge into the combinations the axes produced, never into one
+    // an earlier entry added: a matrix that is nothing but `include` entries
+    // is one job per entry, which is the common way to spell a list of
+    // targets.
+    let original = combinations.len();
 
     for entry in config.include.values() {
         let mut merged_anywhere = false;
 
-        for combination in combinations.iter_mut() {
+        for combination in combinations[..original].iter_mut() {
             // Only the keys that are real axes decide compatibility; keys the
             // matrix does not declare are additions, not constraints.
             let compatible = entry.iter().all(|(key, value)| {
@@ -255,6 +266,25 @@ mod tests {
         assert_eq!(
             rendered(&expand(&config)),
             vec!["os=linux", "os=macos;experimental=true"]
+        );
+    }
+
+    #[test]
+    fn an_include_only_matrix_is_one_job_per_entry() {
+        // No axes at all: each entry is its own combination, and the second
+        // must not fold into the first just because nothing constrains it.
+        let config = matrix(
+            "include:\n  - target: device\n    arch: arm64\n  - target: simulator\n    arch: arm64\n",
+        );
+        let combinations = expand(&config);
+        assert_eq!(combinations.len(), 2);
+        assert_eq!(
+            combinations[0].get("target"),
+            Some(&Value::String("device".to_string()))
+        );
+        assert_eq!(
+            combinations[1].get("target"),
+            Some(&Value::String("simulator".to_string()))
         );
     }
 

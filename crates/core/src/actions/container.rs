@@ -18,7 +18,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::executor::local::{run_tool, supervise};
-use crate::executor::{OutputSink, StepOutcome, StepSession};
+use crate::executor::{container_home, OutputSink, StepOutcome, StepSession};
 use crate::logging::LogLevel;
 use crate::types::WorkflowError;
 
@@ -55,6 +55,13 @@ impl ContainerAction<'_> {
         let session = StepSession::create(self.runner_temp, "sh", "")?;
         let mut env = self.env.clone();
         env.extend(session.file_env());
+        // The image's own `HOME` would do, but a job-scoped one under the
+        // mounted scratch directory is what GitHub's runner gives a container
+        // action, and it means a credential the action writes to `~` is gone
+        // with the job.
+        if !env.contains_key("HOME") {
+            env.insert("HOME".to_string(), container_home(self.runner_temp)?);
+        }
 
         let name = format!("minact-action-{}", uuid::Uuid::new_v4());
         let mut args = vec![

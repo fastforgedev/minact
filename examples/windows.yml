@@ -1,0 +1,80 @@
+# A job on a Windows machine, reached over SSH.
+#
+#   minact run --file examples/windows.yml
+#
+# Needs a `windows-latest` runner in `.minact/config.yml`:
+#
+#   runners:
+#     windows-latest:
+#       type: ssh
+#       host: 192.168.3.19
+#       user: builder
+#       remote-workspace: ~/minact-workspace
+#       exclude: [target, .git]
+#
+# The Windows side needs OpenSSH Server with key login, and Git for Windows.
+# Nothing else — no rsync, no PowerShell 7, no WSL. `shell: bash` is Git Bash,
+# `shell: pwsh` falls back to Windows PowerShell 5.1 when PowerShell 7 is not
+# installed, and `runner.os` is `Windows` while the job is over there.
+
+name: Windows runner
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Where am I
+        id: where
+        run: |
+          echo "runner.os=${{ runner.os }} runner.arch=${{ runner.arch }}"
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          uname -a
+          echo "kernel=$(uname -s)" >> "$GITHUB_OUTPUT"
+
+      - name: PowerShell
+        id: ps
+        shell: pwsh
+        run: |
+          Write-Output "PowerShell $($PSVersionTable.PSVersion) on $env:OS"
+          # Windows PowerShell's `>>` writes UTF-16; minact reads it anyway.
+          "psver=$($PSVersionTable.PSVersion)" >> $env:GITHUB_OUTPUT
+          "FROM_PS=hello from PowerShell" >> $env:GITHUB_ENV
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture |
+            Format-List | Out-File -Encoding utf8 windows-info.txt
+
+      - name: Values cross steps and shells
+        run: |
+          echo "kernel from the bash step: ${{ steps.where.outputs.kernel }}"
+          echo "psver from the pwsh step:  ${{ steps.ps.outputs.psver }}"
+          echo "FROM_PS=$FROM_PS"
+          mkdir -p dist
+          cp windows-info.txt dist/
+          echo "Built on ${{ runner.os }} at $(date -u +%FT%TZ)" > dist/build.txt
+
+      - name: Step summary
+        run: |
+          echo "## Windows build" >> "$GITHUB_STEP_SUMMARY"
+          echo "- $(cmd //c ver | tr -d '\r\n')" >> "$GITHUB_STEP_SUMMARY"
+
+  # Runs here. `dist/` exists because the workspace came back from Windows
+  # when the `build` job finished.
+  use:
+    needs: build
+    steps:
+      - name: What Windows built
+        run: |
+          echo "runner.os here is ${{ runner.os }}"
+          cat dist/build.txt
+          cat dist/windows-info.txt
+
+  # One job definition, two machines.
+  hello:
+    strategy:
+      matrix:
+        on: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.on }}
+    steps:
+      - run: echo "hello from ${{ runner.os }} ($(uname -s))"

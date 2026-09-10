@@ -28,8 +28,11 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use super::local::{env_args, run_tool, supervise};
-use super::{Executor, OutputSink, StepOutcome, StepRequest, StepSession};
+use super::local::{env_args, run_tool, run_tool_streams, supervise};
+use super::{
+    container_home, with_host_env, Executor, OutputSink, Platform, StepOutcome, StepRequest,
+    StepSession,
+};
 use crate::logging::LogLevel;
 use crate::types::WorkflowError;
 
@@ -74,6 +77,9 @@ struct ContainerState {
     container_id: Option<String>,
     /// Whether the image has bash; `sh` is the fallback for minimal images.
     has_bash: bool,
+    /// The image's own `PATH`, which is the only one that means anything
+    /// inside the container.
+    container_path: Option<String>,
 }
 
 impl DockerExecutor {
@@ -97,6 +103,15 @@ impl Executor for DockerExecutor {
         format!("docker ({})", self.config.image)
     }
 
+    fn platform(&self) -> Option<Platform> {
+        // A container is Linux whatever the host is; its architecture is the
+        // host's unless `run-args` says otherwise, so that is left alone.
+        Some(Platform {
+            os: "Linux".to_string(),
+            arch: None,
+        })
+    }
+
     async fn prepare(&self, sink: &dyn OutputSink) -> Result<(), WorkflowError> {
         if self.config.pull {
             sink.note(LogLevel::Info, format!("pulling {}", self.config.image))
@@ -115,6 +130,10 @@ impl Executor for DockerExecutor {
         }
 
         let mut args = vec!["run".to_string(), "--detach".to_string()];
+        // Docker Desktop provides this name already; plain Linux docker does
+        // not. It is what a host proxy on loopback gets rewritten to below.
+        args.push("--add-host".to_string());
+        args.push("host.docker.internal:host-gateway".to_string());
         for mount in &self.config.mounts {
             let path = mount.to_string_lossy();
             args.push("--volume".to_string());
@@ -131,15 +150,25 @@ impl Executor for DockerExecutor {
         // Keep the container alive for the whole job; steps arrive via exec.
         args.extend(["-c".to_string(), "while :; do sleep 3600; done".to_string()]);
 
-        let (ok, output) = run_tool(&self.config.binary, &args).await?;
+        // Two streams, not one: the id is on stdout, and docker puts warnings
+        // — a platform mismatch, say — on stderr. Merging them would make the
+        // last warning look like the container id.
+        let (ok, stdout, stderr) = run_tool_streams(&self.config.binary, &args).await?;
         if !ok {
+            let output = if stderr.is_empty() { stdout } else { stderr };
             return Err(WorkflowError::Other(format!(
                 "failed to start a container from {}: {}",
                 self.config.image, output
             )));
         }
 
-        let container_id = output.lines().last().unwrap_or_default().trim().to_string();
+        let container_id = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .next_back()
+            .unwrap_or_default()
+            .to_string();
         if container_id.is_empty() {
             return Err(WorkflowError::Other(
                 "docker run returned no container id".to_string(),
@@ -168,9 +197,26 @@ impl Executor for DockerExecutor {
             .await;
         }
 
+        // Ask the image what its `PATH` is, once, for the same reason: the
+        // host's is about to be handed to every step and it names host
+        // directories, not the image's.
+        let (ok, container_path) = run_tool(
+            &self.config.binary,
+            &[
+                "exec".to_string(),
+                container_id.clone(),
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf %s \"$PATH\"".to_string(),
+            ],
+        )
+        .await?;
+
         let mut state = self.state.lock().await;
         state.container_id = Some(container_id);
         state.has_bash = has_bash;
+        state.container_path =
+            (ok && !container_path.trim().is_empty()).then(|| container_path.trim().to_string());
 
         Ok(())
     }
@@ -188,11 +234,38 @@ impl Executor for DockerExecutor {
         // container writes to the very same files.
         let session = StepSession::create(&request.runner_temp, &request.shell, &request.script)?;
 
-        let mut env = request.env.clone();
+        // The host environment goes along, as it always has: the workspace
+        // and the action cache are mounted at their host paths, so a good
+        // deal of it still means something inside.
+        let mut env = with_host_env(&request.env, &request.extra_paths);
         env.extend(session.file_env());
 
+        // ...with two exceptions. The host's home is not in the container, so
+        // `$HOME` is a directory of the job's own — unless the workflow set
+        // one itself.
+        if !request.env.contains_key("HOME") {
+            env.insert("HOME".to_string(), container_home(&request.runner_temp)?);
+        }
+
+        // And the host's `PATH` names host directories, so
+        // inside the container it is at best noise and at worst harmful: it
+        // hides the tools the image ships, like the `node` an act-style image
+        // keeps under /opt, which is what a JavaScript action runs on. Put the
+        // image's own `PATH` back, with `$GITHUB_PATH` additions in front.
+        if let Some(container_path) = self.state.lock().await.container_path.clone() {
+            let mut parts: Vec<String> = request.extra_paths.to_vec();
+            parts.push(container_path);
+            env.insert("PATH".to_string(), parts.join(":"));
+        }
+
+        // `http_proxy=http://127.0.0.1:7890` is the same shape of problem:
+        // loopback is the container, not the host that runs the proxy. Point
+        // it back at the host rather than dropping it — the user set it
+        // because that is how this machine reaches the network.
+        redirect_loopback_proxies(&mut env);
+
         let script = session.script_path().to_string_lossy().to_string();
-        let shell = if request.shell == "bash" && !has_bash {
+        let shell = if super::is_bash(&request.shell) && !has_bash {
             "sh"
         } else {
             &request.shell
@@ -326,10 +399,141 @@ pub(crate) fn docker_env_args(env: &HashMap<String, String>) -> Vec<String> {
     env_args(env, "--env")
 }
 
+/// Names of the proxy variables, in both the spellings tools look for.
+const PROXY_VARS: [&str; 8] = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "ftp_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+];
+
+/// The name a container reaches its host by. Docker Desktop defines it, and
+/// `--add-host ...:host-gateway` defines it everywhere else.
+const DOCKER_HOST_ALIAS: &str = "host.docker.internal";
+
+/// Repoint proxy variables that name a loopback address at the host.
+///
+/// A proxy listening on the host's `127.0.0.1` is unreachable from inside a
+/// container, where that address is the container itself — every fetch fails
+/// with a connection refused that looks nothing like a proxy problem.
+fn redirect_loopback_proxies(env: &mut HashMap<String, String>) {
+    for name in PROXY_VARS {
+        let Some(value) = env.get(name) else { continue };
+        if let Some(rewritten) = rewrite_loopback_host(value) {
+            env.insert(name.to_string(), rewritten);
+        }
+    }
+}
+
+/// Swap a loopback host in a proxy URL for [`DOCKER_HOST_ALIAS`], or `None`
+/// when the URL does not name one.
+fn rewrite_loopback_host(url: &str) -> Option<String> {
+    let (prefix, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (format!("{}://", scheme), rest),
+        None => (String::new(), url),
+    };
+
+    // Authority runs to the first `/`, `?` or `#`; credentials stay put.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (credentials, host_port) = match authority.rsplit_once('@') {
+        Some((credentials, host_port)) => (format!("{}@", credentials), host_port),
+        None => (String::new(), authority),
+    };
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        // A bare IPv6 literal is full of colons; only a `]:` is a port.
+        Some((host, port)) if !port.contains(']') => (host, format!(":{}", port)),
+        _ => (host_port, String::new()),
+    };
+
+    if !is_loopback(host) {
+        return None;
+    }
+
+    Some(format!(
+        "{}{}{}{}{}",
+        prefix, credentials, DOCKER_HOST_ALIAS, port, tail
+    ))
+}
+
+/// Whether a URL host names the local machine.
+fn is_loopback(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn a_proxy_on_loopback_is_repointed_at_the_host() {
+        assert_eq!(
+            rewrite_loopback_host("http://127.0.0.1:7890").as_deref(),
+            Some("http://host.docker.internal:7890")
+        );
+        assert_eq!(
+            rewrite_loopback_host("http://localhost:8080/path").as_deref(),
+            Some("http://host.docker.internal:8080/path")
+        );
+        assert_eq!(
+            rewrite_loopback_host("socks5://user:pw@127.0.0.2:1080").as_deref(),
+            Some("socks5://user:pw@host.docker.internal:1080")
+        );
+        assert_eq!(
+            rewrite_loopback_host("http://[::1]:7890").as_deref(),
+            Some("http://host.docker.internal:7890")
+        );
+        // No scheme is still a proxy value tools accept.
+        assert_eq!(
+            rewrite_loopback_host("127.0.0.1:7890").as_deref(),
+            Some("host.docker.internal:7890")
+        );
+    }
+
+    #[test]
+    fn a_proxy_that_is_already_reachable_is_left_alone() {
+        assert_eq!(rewrite_loopback_host("http://proxy.corp:3128"), None);
+        assert_eq!(rewrite_loopback_host("http://10.0.0.5:7890"), None);
+        assert_eq!(
+            rewrite_loopback_host("http://host.docker.internal:7890"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_proxy_variables_are_rewritten() {
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert(
+            "HTTPS_PROXY".to_string(),
+            "http://127.0.0.1:7890".to_string(),
+        );
+        env.insert(
+            "http_proxy".to_string(),
+            "http://127.0.0.1:7890".to_string(),
+        );
+        env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+        env.insert("API_URL".to_string(), "http://127.0.0.1:9000".to_string());
+
+        redirect_loopback_proxies(&mut env);
+
+        assert_eq!(env["HTTPS_PROXY"], "http://host.docker.internal:7890");
+        assert_eq!(env["http_proxy"], "http://host.docker.internal:7890");
+        // `NO_PROXY` is a host list, not a URL, and the container's own
+        // loopback is exactly what it should keep excluding.
+        assert_eq!(env["NO_PROXY"], "localhost,127.0.0.1");
+        assert_eq!(env["API_URL"], "http://127.0.0.1:9000");
+    }
 
     #[test]
     fn mounts_cover_workspace_and_temp() {

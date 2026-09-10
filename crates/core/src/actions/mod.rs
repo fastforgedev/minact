@@ -25,7 +25,13 @@ pub use store::ActionStore;
 use crate::types::{Context, StepConclusion, WorkflowError};
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Where `upload-artifact` puts its files and `download-artifact` looks for
+/// them, relative to the workspace. Inside `.minact` with everything else of
+/// minact's, but not under `_work`: artifacts are the user's output, and the
+/// underscore marks what is the runner's own.
+pub const ARTIFACTS_DIR: &str = ".minact/artifacts";
 
 /// The output from a single action execution.
 #[derive(Debug, Clone)]
@@ -204,12 +210,32 @@ impl Action for CacheAction {
 
         let cache_hit = if cache_entry.exists() {
             tracing::info!("[actions/cache] Cache hit for key: {}", key);
-            // Restore from cache
+            // Restore from cache. What is there now is set aside rather than
+            // deleted, so a copy that fails halfway leaves it as it was — a
+            // half-restored Flutter SDK is worse than an un-restored one.
             let cache_path = Path::new(path);
-            if cache_path.exists() {
-                std::fs::remove_dir_all(cache_path).ok();
+            let previous = cache_path.with_extension("minact-previous");
+            let had_previous = cache_path.exists();
+            if had_previous {
+                if previous.exists() {
+                    std::fs::remove_dir_all(&previous).ok();
+                }
+                std::fs::rename(cache_path, &previous)?;
             }
-            copy_recursive(&cache_entry, cache_path)?;
+            match copy_recursive(&cache_entry, cache_path) {
+                Ok(()) => {
+                    if had_previous {
+                        std::fs::remove_dir_all(&previous).ok();
+                    }
+                }
+                Err(e) => {
+                    std::fs::remove_dir_all(cache_path).ok();
+                    if had_previous {
+                        std::fs::rename(&previous, cache_path).ok();
+                    }
+                    return Err(e);
+                }
+            }
             true
         } else {
             tracing::info!("[actions/cache] Cache miss for key: {}", key);
@@ -242,24 +268,40 @@ fn sha2_hex(input: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Copy a file or a tree. A symlink is recreated as a symlink — a macOS
+/// framework is mostly `Resources -> Versions/Current/Resources` — and
+/// anything that is neither file, directory nor link (a socket, a fifo) is
+/// left out rather than failing the copy.
 fn copy_recursive(src: &Path, dst: &Path) -> Result<(), WorkflowError> {
-    if src.is_file() {
+    let kind = std::fs::symlink_metadata(src)?.file_type();
+    if kind.is_symlink() {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let target = std::fs::read_link(src)?;
+        if dst.exists() || std::fs::symlink_metadata(dst).is_ok() {
+            std::fs::remove_file(dst)?;
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, dst)?;
+        #[cfg(windows)]
+        {
+            if src.is_dir() {
+                std::os::windows::fs::symlink_dir(&target, dst)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, dst)?;
+            }
+        }
+    } else if kind.is_file() {
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::copy(src, dst)?;
-    } else if src.is_dir() {
+    } else if kind.is_dir() {
         std::fs::create_dir_all(dst)?;
         for entry in std::fs::read_dir(src)? {
             let entry = entry?;
-            let file_type = entry.file_type()?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            if file_type.is_dir() {
-                copy_recursive(&src_path, &dst_path)?;
-            } else {
-                std::fs::copy(&src_path, &dst_path)?;
-            }
+            copy_recursive(&entry.path(), &dst.join(entry.file_name()))?;
         }
     }
     Ok(())
@@ -278,11 +320,6 @@ impl Action for UploadArtifactAction {
     }
 
     fn validate(&self, ctx: &ActionContext) -> Result<(), WorkflowError> {
-        if !ctx.inputs.contains_key("name") {
-            return Err(WorkflowError::Other(
-                "actions/upload-artifact requires 'name' input".to_string(),
-            ));
-        }
         if !ctx.inputs.contains_key("path") {
             return Err(WorkflowError::Other(
                 "actions/upload-artifact requires 'path' input".to_string(),
@@ -292,39 +329,133 @@ impl Action for UploadArtifactAction {
     }
 
     async fn run(&self, ctx: &ActionContext) -> Result<ActionOutput, WorkflowError> {
-        let name = &ctx.inputs["name"];
-        let path = &ctx.inputs["path"];
-        let src_path = if Path::new(path).is_absolute() {
-            Path::new(path).to_path_buf()
-        } else {
-            ctx.workspace.join(path)
-        };
+        // GitHub's default when `name:` is left out.
+        let name = ctx
+            .inputs
+            .get("name")
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("artifact")
+            .to_string();
+        let if_no_files = ctx
+            .inputs
+            .get("if-no-files-found")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "warn".to_string());
 
-        // Store artifacts in the workspace's artifact directory
-        let artifact_dir = ctx.workspace.join(".minact-artifacts").join(name);
+        // `path:` is one entry per line, each a path or a glob, the way the
+        // real action takes it.
+        let mut matched: Vec<PathBuf> = Vec::new();
+        for line in ctx.inputs["path"].lines() {
+            let pattern = line.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            if pattern.starts_with('!') {
+                tracing::warn!(
+                    "[actions/upload-artifact] exclusion patterns are not supported, ignoring {}",
+                    pattern
+                );
+                continue;
+            }
+            matched.extend(expand_path(&ctx.workspace, pattern));
+        }
+        matched.sort();
+        matched.dedup();
+
+        if matched.is_empty() {
+            let message = format!(
+                "No files were found with the provided path: {}",
+                ctx.inputs["path"].trim()
+            );
+            match if_no_files.as_str() {
+                "error" => return Err(WorkflowError::Other(message)),
+                "ignore" => {}
+                _ => tracing::warn!("[actions/upload-artifact] {}", message),
+            }
+        }
+
+        // A fresh upload replaces an earlier one of the same name.
+        let artifact_dir = ctx.workspace.join(ARTIFACTS_DIR).join(&name);
+        if artifact_dir.exists() {
+            std::fs::remove_dir_all(&artifact_dir)?;
+        }
         std::fs::create_dir_all(&artifact_dir)?;
 
-        if src_path.exists() {
-            copy_recursive(&src_path, &artifact_dir)?;
-            tracing::info!(
-                "[actions/upload-artifact] Uploaded '{}' from {}",
-                name,
-                path
-            );
-        } else {
-            tracing::warn!("[actions/upload-artifact] Path '{}' does not exist", path);
+        // A single directory uploads its contents; anything else keeps the
+        // hierarchy below the paths' common ancestor, as on GitHub.
+        let root = artifact_root(&matched);
+        for entry in &matched {
+            let relative = entry.strip_prefix(&root).unwrap_or(entry);
+            let target = if relative.as_os_str().is_empty() {
+                artifact_dir.clone()
+            } else {
+                artifact_dir.join(relative)
+            };
+            copy_recursive(entry, &target)?;
         }
+        tracing::info!(
+            "[actions/upload-artifact] Uploaded '{}' ({} entries)",
+            name,
+            matched.len()
+        );
 
         Ok(ActionOutput {
             success: true,
             conclusion: StepConclusion::Success,
             outputs: HashMap::new(),
             artifacts: vec![crate::types::Artifact {
-                name: name.clone(),
+                name,
                 path: artifact_dir,
             }],
         })
     }
+}
+
+/// Resolve one `path:` line against the workspace: a plain path if it
+/// exists, or everything a glob matches.
+fn expand_path(workspace: &Path, pattern: &str) -> Vec<PathBuf> {
+    let absolute = if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        workspace.join(pattern)
+    };
+    if !pattern.contains(['*', '?', '[']) {
+        return if absolute.exists() {
+            vec![absolute]
+        } else {
+            Vec::new()
+        };
+    }
+    crate::expr::glob_files(workspace, pattern)
+}
+
+/// The directory an artifact's paths are stored relative to: the directory
+/// itself when there is exactly one, otherwise the deepest directory holding
+/// every entry.
+fn artifact_root(entries: &[PathBuf]) -> PathBuf {
+    if let [only] = entries {
+        if only.is_dir() {
+            return only.clone();
+        }
+    }
+    let mut root: Option<PathBuf> = None;
+    for entry in entries {
+        let dir = entry.parent().map(Path::to_path_buf).unwrap_or_default();
+        root = Some(match root {
+            None => dir,
+            Some(current) => common_ancestor(&current, &dir),
+        });
+    }
+    root.unwrap_or_default()
+}
+
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    a.components()
+        .zip(b.components())
+        .take_while(|(x, y)| x == y)
+        .map(|(x, _)| x)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -339,40 +470,105 @@ impl Action for DownloadArtifactAction {
         "actions/download-artifact"
     }
 
-    fn validate(&self, ctx: &ActionContext) -> Result<(), WorkflowError> {
-        if !ctx.inputs.contains_key("name") {
-            return Err(WorkflowError::Other(
-                "actions/download-artifact requires 'name' input".to_string(),
-            ));
-        }
+    fn validate(&self, _ctx: &ActionContext) -> Result<(), WorkflowError> {
+        // `name` is optional: without it every artifact is downloaded.
         Ok(())
     }
 
     async fn run(&self, ctx: &ActionContext) -> Result<ActionOutput, WorkflowError> {
-        let name = &ctx.inputs["name"];
+        let store = ctx.workspace.join(ARTIFACTS_DIR);
         let dest = ctx
             .inputs
             .get("path")
-            .cloned()
-            .unwrap_or_else(|| ".".to_string());
-
-        let artifact_dir = ctx.workspace.join(".minact-artifacts").join(name);
-        let dest_path = if Path::new(&dest).is_absolute() {
-            Path::new(&dest).to_path_buf()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty())
+            .unwrap_or(".");
+        let dest_path = if Path::new(dest).is_absolute() {
+            PathBuf::from(dest)
         } else {
-            ctx.workspace.join(&dest)
+            ctx.workspace.join(dest)
         };
+        let name = ctx
+            .inputs
+            .get("name")
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty());
 
-        if artifact_dir.exists() {
-            std::fs::create_dir_all(&dest_path)?;
-            copy_recursive(&artifact_dir, &dest_path)?;
-            tracing::info!(
-                "[actions/download-artifact] Downloaded '{}' to {}",
-                name,
-                dest
-            );
-        } else {
-            tracing::warn!("[actions/download-artifact] Artifact '{}' not found", name);
+        match name {
+            // One artifact: its contents land in `path`.
+            Some(name) => {
+                let artifact_dir = store.join(name);
+                if artifact_dir.exists() {
+                    std::fs::create_dir_all(&dest_path)?;
+                    copy_recursive(&artifact_dir, &dest_path)?;
+                    tracing::info!(
+                        "[actions/download-artifact] Downloaded '{}' to {}",
+                        name,
+                        dest
+                    );
+                } else {
+                    tracing::warn!("[actions/download-artifact] Artifact '{}' not found", name);
+                }
+            }
+            // No name: every artifact, each in its own directory under
+            // `path` — or all in `path` with `merge-multiple: true`.
+            None => {
+                let merge = ctx
+                    .inputs
+                    .get("merge-multiple")
+                    .map(|value| value.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let patterns: Vec<glob::Pattern> = ctx
+                    .inputs
+                    .get("pattern")
+                    .map(|value| {
+                        value
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(|line| {
+                                glob::Pattern::new(line).map_err(|e| {
+                                    WorkflowError::Other(format!(
+                                        "actions/download-artifact: bad pattern {}: {}",
+                                        line, e
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+
+                let mut names: Vec<String> = match std::fs::read_dir(&store) {
+                    Ok(entries) => entries
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().is_dir())
+                        .map(|entry| entry.file_name().to_string_lossy().to_string())
+                        .filter(|name| {
+                            patterns.is_empty() || patterns.iter().any(|p| p.matches(name))
+                        })
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                names.sort();
+                if names.is_empty() {
+                    tracing::warn!("[actions/download-artifact] No artifacts to download");
+                }
+                for name in &names {
+                    let target = if merge {
+                        dest_path.clone()
+                    } else {
+                        dest_path.join(name)
+                    };
+                    std::fs::create_dir_all(&target)?;
+                    copy_recursive(&store.join(name), &target)?;
+                }
+                tracing::info!(
+                    "[actions/download-artifact] Downloaded {} artifact(s) to {}",
+                    names.len(),
+                    dest
+                );
+            }
         }
 
         Ok(ActionOutput {

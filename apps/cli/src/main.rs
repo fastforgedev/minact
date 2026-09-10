@@ -57,6 +57,10 @@ enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
 
+        /// Run only this job (and the jobs it needs); repeatable
+        #[arg(short = 'j', long = "job")]
+        jobs: Vec<String>,
+
         /// Log output format
         #[arg(long, value_enum, default_value_t = LogFormat::Pretty)]
         log_format: LogFormat,
@@ -147,8 +151,9 @@ async fn main() -> anyhow::Result<()> {
             workspace,
             input,
             config,
+            jobs,
             log_format,
-        } => cmd_run(file, event, workspace, input, config, log_format).await,
+        } => cmd_run(file, event, workspace, input, config, jobs, log_format).await,
         Commands::List { dir, verbose } => cmd_list(dir, verbose),
         Commands::Validate { file } => cmd_validate(file),
         Commands::Studio {
@@ -167,6 +172,7 @@ async fn cmd_run(
     workspace: Option<PathBuf>,
     input: Vec<KeyVal>,
     config: Option<PathBuf>,
+    jobs: Vec<String>,
     log_format: LogFormat,
 ) -> anyhow::Result<()> {
     let workspace = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
@@ -226,7 +232,9 @@ async fn cmd_run(
         },
     };
 
-    let engine = Engine::with_reporter(workspace, reporter).with_config(project_config);
+    let engine = Engine::with_reporter(workspace, reporter)
+        .with_config(project_config)
+        .with_jobs(jobs);
 
     // Steps run in their own process group, so Ctrl+C no longer reaches them
     // on its own. Turn it into a cancellation instead, which kills the group

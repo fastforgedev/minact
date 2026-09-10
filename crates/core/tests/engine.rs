@@ -958,19 +958,41 @@ jobs:
 }
 
 #[tokio::test]
-async fn pipefail_is_enabled_for_bash() {
+async fn pipefail_is_enabled_only_when_bash_is_asked_for_by_name() {
     let dir = workspace();
-    let yaml = r#"
+
+    // `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`.
+    let named = r#"
 name: PipeFail
 on: workflow_dispatch
 jobs:
   strict:
     steps:
+      - shell: bash
+        run: false | true
+"#;
+    let (result, _) = run_in(named, dir.path()).await;
+    assert!(
+        !result.success,
+        "under an explicit `shell: bash` a failing pipe stage should fail the step"
+    );
+
+    // Naming no shell is `bash -e {0}`, which leaves pipelines alone. A step
+    // like `x=$(ls | grep -E '^[0-9]+$' | head -1)` finding no match is
+    // ordinary on GitHub, and must stay ordinary here.
+    let default = r#"
+name: PipeFail
+on: workflow_dispatch
+jobs:
+  lenient:
+    steps:
       - run: false | true
 "#;
-
-    let (result, _) = run_in(yaml, dir.path()).await;
-    assert!(!result.success, "a failing pipe stage should fail the step");
+    let (result, _) = run_in(default, dir.path()).await;
+    assert!(
+        result.success,
+        "without an explicit shell there is no pipefail, as on GitHub"
+    );
 }
 
 #[tokio::test]
@@ -1319,4 +1341,106 @@ jobs:
         commands
     );
     assert!(!stdout(&events).contains("hunter2"), "{}", stdout(&events));
+}
+
+#[tokio::test]
+async fn runner_temp_is_a_job_directory_under_the_work_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+name: work-tree
+on: workflow_dispatch
+jobs:
+  first:
+    steps:
+      - run: |
+          echo "TEMP=$RUNNER_TEMP"
+          echo "TOOLS=$RUNNER_TOOL_CACHE"
+          test -d "$RUNNER_TEMP" && echo "temp exists"
+          test -d "$RUNNER_TOOL_CACHE" && echo "tools exist"
+          echo scratch > "$RUNNER_TEMP/note"
+  second:
+    needs: first
+    steps:
+      - run: echo "TEMP=$RUNNER_TEMP"
+"#;
+
+    let (result, events) = run_in(yaml, dir.path()).await;
+    assert!(result.success, "{}", stdout(&events));
+    let out = stdout(&events);
+    assert!(out.contains("temp exists\n"), "{}", out);
+    assert!(out.contains("tools exist\n"), "{}", out);
+
+    let work = dir.path().join(".minact").join("_work");
+    let temps: Vec<String> = stdout_lines(&events)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("TEMP=").map(str::to_string))
+        .collect();
+    assert_eq!(temps.len(), 2, "{:?}", temps);
+    for temp in &temps {
+        assert!(
+            std::path::Path::new(temp).starts_with(work.join("_temp")),
+            "$RUNNER_TEMP is under .minact/_work/_temp: {}",
+            temp
+        );
+        assert!(
+            !std::path::Path::new(temp).exists(),
+            "a job's scratch directory goes with the job: {}",
+            temp
+        );
+    }
+    assert_ne!(
+        temps[0], temps[1],
+        "each job gets its own scratch directory"
+    );
+    assert!(
+        temps[0].contains("/first-") && temps[1].contains("/second-"),
+        "named after the job: {:?}",
+        temps
+    );
+
+    assert!(
+        out.contains(&format!("TOOLS={}\n", work.join("_tool").display()))
+            || std::env::var_os("RUNNER_TOOL_CACHE").is_some(),
+        "$RUNNER_TOOL_CACHE is .minact/_work/_tool: {}",
+        out
+    );
+    assert!(work.join(".gitignore").is_file(), "the tree ignores itself");
+}
+
+#[tokio::test]
+async fn the_event_payload_is_always_a_file_under_the_job_temp() {
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = r#"
+name: event-path
+on: workflow_dispatch
+jobs:
+  j:
+    steps:
+      - run: |
+          echo "EVENT=$GITHUB_EVENT_PATH"
+          echo "CTX=${{ github.event_path }}"
+          cat "$GITHUB_EVENT_PATH"
+"#;
+
+    let (result, events) = run_in(yaml, dir.path()).await;
+    assert!(result.success, "{}", stdout(&events));
+    let out = stdout(&events);
+    let event_path = stdout_lines(&events)
+        .into_iter()
+        .find_map(|line| line.strip_prefix("EVENT=").map(str::to_string))
+        .expect("GITHUB_EVENT_PATH is set even with no payload");
+    let path = std::path::Path::new(&event_path);
+    assert!(
+        path.starts_with(dir.path().join(".minact/_work/_temp")),
+        "under the job's scratch directory: {}",
+        event_path
+    );
+    assert!(
+        path.ends_with("_github_workflow/event.json"),
+        "named the way the runner names it: {}",
+        event_path
+    );
+    assert!(out.contains(&format!("CTX={}\n", event_path)), "{}", out);
+    // With no payload supplied the file is an empty object, not missing.
+    assert!(out.contains("{}"), "{}", out);
 }

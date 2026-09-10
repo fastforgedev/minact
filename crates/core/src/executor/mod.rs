@@ -22,6 +22,7 @@ pub mod ssh;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -41,10 +42,25 @@ pub struct StepRequest {
     pub shell: String,
     /// Absolute working directory, as it exists on the host.
     pub working_directory: PathBuf,
-    /// The step's environment, *without* the `GITHUB_OUTPUT` / `GITHUB_ENV` /
-    /// `GITHUB_PATH` / `GITHUB_STEP_SUMMARY` variables — only the executor
-    /// knows where those files live from the step's point of view.
+    /// What the workflow and the engine set: the `GITHUB_*` / `RUNNER_*`
+    /// variables, `env:` at every level, `$GITHUB_ENV` exports and action
+    /// inputs. *Not* the host's own environment — an executor that runs
+    /// steps on this machine layers that underneath with [`with_host_env`],
+    /// and one that runs them elsewhere must not, or the remote would be
+    /// working with this machine's `PATH` and `HOME`.
+    ///
+    /// Also without the `GITHUB_OUTPUT` / `GITHUB_ENV` / `GITHUB_PATH` /
+    /// `GITHUB_STEP_SUMMARY` variables — only the executor knows where those
+    /// files live from the step's point of view.
     pub env: HashMap<String, String>,
+    /// Directories `$GITHUB_PATH` added so far in this job, most recent
+    /// first, as host paths. They go in front of wherever the step's `PATH`
+    /// comes from.
+    pub extra_paths: Vec<String>,
+    /// For a JavaScript action: the Node major it declared (`using: node20`).
+    /// An executor that has to supply a `node` of its own installs that one;
+    /// otherwise whatever `node` is on the runner is used as it is.
+    pub node: Option<u32>,
     /// Directory the executor may create per-step scratch space in.
     pub runner_temp: PathBuf,
     /// When set, the executor spawns this argv instead of writing `script` to
@@ -70,6 +86,32 @@ impl StepRequest {
         }
     }
 }
+
+/// The environment a step gets when it runs on this machine: the host's,
+/// with the request's values layered on top and `$GITHUB_PATH` additions in
+/// front of `PATH`.
+pub(crate) fn with_host_env(
+    env: &HashMap<String, String>,
+    extra_paths: &[String],
+) -> HashMap<String, String> {
+    let mut merged: HashMap<String, String> = std::env::vars().collect();
+    merged.extend(env.iter().map(|(key, value)| (key.clone(), value.clone())));
+    if !extra_paths.is_empty() {
+        let mut parts: Vec<String> = extra_paths.to_vec();
+        if let Some(current) = merged.get("PATH") {
+            if !current.is_empty() {
+                parts.push(current.clone());
+            }
+        }
+        merged.insert("PATH".to_string(), parts.join(PATH_SEPARATOR));
+    }
+    merged
+}
+
+#[cfg(windows)]
+const PATH_SEPARATOR: &str = ";";
+#[cfg(not(windows))]
+const PATH_SEPARATOR: &str = ":";
 
 /// Raw contents of the four files a step can write back through.
 #[derive(Debug, Default, Clone)]
@@ -101,6 +143,18 @@ pub struct StepFileValues {
     pub env: Vec<(String, String)>,
     pub paths: Vec<String>,
     pub summary: String,
+}
+
+/// Where an executor's steps actually run, spelled the way `runner.os` and
+/// `runner.arch` are: `Linux`, `macOS`, `Windows` and `X64`, `ARM64`.
+///
+/// The host's own platform is the default; a backend that runs somewhere
+/// else says so once it knows, which for a remote host is after `prepare`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Platform {
+    pub os: String,
+    /// `None` when the backend cannot tell and the host's value should stand.
+    pub arch: Option<String>,
 }
 
 /// How a step finished.
@@ -136,6 +190,14 @@ pub trait Executor: Send + Sync {
     /// Short description for logs, e.g. `local` or `docker (ubuntu:24.04)`.
     fn describe(&self) -> String;
 
+    /// The platform steps run on, when it is not this machine's.
+    ///
+    /// Consulted after [`prepare`](Executor::prepare), so a backend that has
+    /// to ask the other end can answer.
+    fn platform(&self) -> Option<Platform> {
+        None
+    }
+
     /// Called once before a job's first step.
     async fn prepare(&self, _sink: &dyn OutputSink) -> Result<(), WorkflowError> {
         Ok(())
@@ -164,6 +226,27 @@ pub trait Executor: Send + Sync {
         sink: &dyn OutputSink,
         cancel: &CancellationToken,
     ) -> Result<StepOutcome, WorkflowError>;
+
+    /// Bring what the steps produced to the host, before something on the
+    /// host reads the workspace.
+    ///
+    /// Registered actions run in-process and look at the host workspace, so
+    /// on a remote runner `upload-artifact` would otherwise upload a build
+    /// that is still on the other machine. A no-op where the host is the
+    /// runner.
+    async fn sync_back(&self, _sink: &dyn OutputSink) -> Result<(), WorkflowError> {
+        Ok(())
+    }
+
+    /// Send what the host changed since `since` to where the steps run — a
+    /// restored cache, say. The counterpart of [`sync_back`](Executor::sync_back).
+    async fn sync_forward(
+        &self,
+        _since: SystemTime,
+        _sink: &dyn OutputSink,
+    ) -> Result<(), WorkflowError> {
+        Ok(())
+    }
 
     /// Called once after a job's last step, including when a step failed.
     async fn cleanup(&self, _sink: &dyn OutputSink) {}
@@ -266,6 +349,46 @@ fn read_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// The `$HOME` a container gets: `_github_home` under the job's scratch
+/// directory, created on demand.
+///
+/// The host's home does not exist inside a container, so inheriting `HOME`
+/// leaves every tool that writes under `~` — npm, pip, git — pointing at
+/// nothing. GitHub's runner gives each job container a home of its own under
+/// `_temp` for the same reason, and it has the same second benefit: whatever
+/// a job leaves in `~` goes when the job does.
+pub(crate) fn container_home(runner_temp: &Path) -> Result<String, WorkflowError> {
+    let home = runner_temp.join("_github_home");
+    std::fs::create_dir_all(&home)?;
+    Ok(home.to_string_lossy().to_string())
+}
+
+/// The shell a step runs under when it names none.
+///
+/// This is deliberately not the string `"bash"`. GitHub's *default* shell is
+/// `bash -e {0}`, while an explicit `shell: bash` is
+/// `bash --noprofile --norc -eo pipefail {0}` — so a step that names no shell
+/// does **not** get `pipefail`. The difference is not cosmetic: under
+/// `pipefail` a pipeline whose first stage fails takes the step down with it,
+/// and `x=$(ls | grep -E '^[0-9]+$' | head -1)` finding no match is an
+/// everyday way for that to happen.
+pub(crate) const DEFAULT_SHELL: &str = "bash-default";
+
+/// Whether a shell name means bash, either spelling.
+pub(crate) fn is_bash(shell: &str) -> bool {
+    shell == "bash" || shell == DEFAULT_SHELL
+}
+
+/// The name to report a shell by. The sentinel is an implementation detail —
+/// a log, and anything parsing one, should see the shell that actually ran.
+pub(crate) fn display_shell(shell: &str) -> &str {
+    if shell == DEFAULT_SHELL {
+        "bash"
+    } else {
+        shell
+    }
+}
+
 /// The file extension to give a step's script, so interpreters that care
 /// (PowerShell) get the right one.
 pub(crate) fn script_extension(shell: &str) -> &'static str {
@@ -301,7 +424,10 @@ pub(crate) fn resolve_shell(shell: &str, script: &str) -> (String, Vec<String>) 
     };
 
     match shell {
-        // GitHub's default: fail on the first error and on a failing pipe stage.
+        // A step that named no shell: fail on the first error, but leave
+        // pipelines alone. See `DEFAULT_SHELL`.
+        DEFAULT_SHELL => ("bash".to_string(), args(&["-e"])),
+        // Asked for by name: also fail on a failing pipe stage.
         "bash" => (
             "bash".to_string(),
             args(&["--noprofile", "--norc", "-eo", "pipefail"]),
@@ -340,6 +466,12 @@ mod tests {
 
     #[test]
     fn resolves_the_default_shells() {
+        // A step that named no shell gets `bash -e` — GitHub's default, and
+        // pointedly not `pipefail`.
+        let (program, args) = resolve_shell(DEFAULT_SHELL, "/tmp/s.sh");
+        assert_eq!(program, "bash");
+        assert_eq!(args, ["-e", "/tmp/s.sh"]);
+
         let (program, args) = resolve_shell("bash", "/tmp/s.sh");
         assert_eq!(program, "bash");
         assert_eq!(
@@ -399,6 +531,16 @@ mod tests {
 
         // And nothing was executed along the way.
         assert!(!std::path::Path::new("/tmp/pwned").exists());
+    }
+
+    #[test]
+    fn a_container_home_lives_under_the_job_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = container_home(temp.path()).unwrap();
+        assert_eq!(Path::new(&home), temp.path().join("_github_home"));
+        assert!(Path::new(&home).is_dir(), "created so `cd ~` works at once");
+        // Asking again is fine; the directory is the same one.
+        assert_eq!(container_home(temp.path()).unwrap(), home);
     }
 
     #[test]

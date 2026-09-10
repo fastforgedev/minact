@@ -11,7 +11,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
-use super::{resolve_shell, Executor, OutputSink, StepOutcome, StepRequest, StepSession};
+use super::{
+    resolve_shell, with_host_env, Executor, OutputSink, StepOutcome, StepRequest, StepSession,
+};
 use crate::logging::{CommandStream, LogLevel};
 use crate::types::WorkflowError;
 
@@ -39,7 +41,7 @@ impl Executor for LocalExecutor {
     ) -> Result<StepOutcome, WorkflowError> {
         let session = StepSession::create(&request.runner_temp, &request.shell, &request.script)?;
 
-        let mut env = request.env.clone();
+        let mut env = with_host_env(&request.env, &request.extra_paths);
         env.extend(session.file_env());
 
         let script = session.script_path().to_string_lossy().to_string();
@@ -68,7 +70,7 @@ impl Executor for LocalExecutor {
             // Fall back to sh rather than failing the step outright.
             Err(e)
                 if e.kind() == ErrorKind::NotFound
-                    && request.shell == "bash"
+                    && super::is_bash(&request.shell)
                     && request.command.is_none() =>
             {
                 sink.note(
@@ -213,22 +215,40 @@ pub(crate) async fn run_tool(
     program: &str,
     args: &[String],
 ) -> Result<(bool, String), WorkflowError> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| WorkflowError::Other(format!("failed to run `{}`: {}", program, e)))?;
+    let (ok, stdout, stderr) = run_tool_streams(program, args).await?;
 
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
+    let mut text = stdout;
+    if !stderr.is_empty() {
         if !text.is_empty() {
             text.push('\n');
         }
         text.push_str(&stderr);
     }
 
-    Ok((output.status.success(), text.trim().to_string()))
+    Ok((ok, text.trim().to_string()))
+}
+
+/// Run a command to completion, keeping its two streams apart.
+///
+/// `run_tool` merges them, which is right for a message shown to the user and
+/// wrong for anything parsed: `docker run --detach` prints the container id on
+/// stdout while writing warnings — a platform mismatch, say — to stderr, and a
+/// merged view leaves no way to tell which line is the id.
+pub(crate) async fn run_tool_streams(
+    program: &str,
+    args: &[String],
+) -> Result<(bool, String, String), WorkflowError> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| WorkflowError::Other(format!("failed to run `{}`: {}", program, e)))?;
+
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    ))
 }
 
 /// Environment as `-e KEY=VALUE` style arguments.

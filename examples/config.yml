@@ -46,14 +46,25 @@ runners:
   # Another machine, for what containers cannot give you: Windows, or real
   # macOS hardware for signing and notarisation.
   #
-  # The workspace is pushed with rsync before the job and pulled back after,
-  # so artifacts the remote produces land in your local workspace.
-  # Requires key-based SSH login that already works non-interactively.
+  # The workspace is pushed before the job and pulled back after, so artifacts
+  # the remote produces land in your local workspace — with rsync when both
+  # ends have it, as a tar stream otherwise. Requires key-based SSH login that
+  # already works non-interactively.
+  #
+  # A Windows machine needs nothing but OpenSSH Server and Git for Windows:
+  # minact finds Git Bash next to git.exe and runs the job through it, so
+  # `shell: bash` and `shell: pwsh` steps both work and `runner.os` is
+  # `Windows` while the job is there.
   windows-latest:
     type: ssh
     host: win-builder.local
     user: builder
-    remote-workspace: C:/minact/workspace
+    # `~` is the remote user's home; `C:/minact/workspace` works too.
+    remote-workspace: ~/minact-workspace
+    # Not worth sending to a build box, in either direction.
+    exclude: [target, node_modules, .git]
+    # Where Git Bash is, when it is not next to the `git.exe` on PATH.
+    # shell: D:/tools/Git/bin/bash.exe
 
   mac-signer:
     type: ssh

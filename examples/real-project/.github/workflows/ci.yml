@@ -1,0 +1,76 @@
+# The kind of CI a real repository has, run locally against this directory:
+#
+#   minact run --workspace examples/real-project --event push
+#
+# `--workspace` is the project to run in: its `.github/workflows/` is where
+# this file is found, and `defaults.run.working-directory` is relative to it.
+# `actions/checkout`, `actions/setup-node` and the artifact actions are the
+# real ones — setup-node downloads a Node, upload/download move real files.
+#
+# `macos-latest` runs here; `windows-latest` runs on the machine mapped to it
+# in `.minact/config.yml` (pass `--config` when that file lives elsewhere).
+# The `collect` job has no `ubuntu-latest` mapping and runs here with a
+# warning, or in a container once one is configured.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: app
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        node: [20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Report
+        shell: bash
+        run: |
+          echo "node $(node --version) on ${{ runner.os }}"
+          echo "### ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+          cat dist/BUILD.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: app/dist
+
+  collect:
+    name: Collect the builds
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: builds
+      - name: List what every platform built
+        working-directory: .
+        run: |
+          find builds -type f | sort
+          cat builds/*/BUILD.txt

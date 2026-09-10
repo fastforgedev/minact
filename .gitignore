@@ -15,6 +15,10 @@ target/
 Thumbs.db
 
 # Minact
-.minact-artifacts/
+# What `actions/upload-artifact` produces; outputs, not source.
+.minact/artifacts/
 # Run history Studio records per project; local state, not source.
 .minact/runs/
+# The runner's own tree: job scratch space and the tool cache. It carries a
+# `.gitignore` of its own too, for projects that never touch this file.
+.minact/_work/

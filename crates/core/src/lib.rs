@@ -15,6 +15,7 @@ pub mod config;
 pub mod engine;
 pub mod executor;
 pub mod expr;
+pub mod layout;
 pub mod logging;
 pub mod matrix;
 pub mod parser;
@@ -23,11 +24,14 @@ pub mod scheduler;
 pub mod types;
 pub mod workflow;
 
-pub use actions::{ActionManifest, ActionRef, ActionRegistry, ActionRuns, ActionStore};
+pub use actions::{
+    ActionManifest, ActionRef, ActionRegistry, ActionRuns, ActionStore, ARTIFACTS_DIR,
+};
 pub use commands::{parse_key_value_file, parse_path_file, parse_workflow_command};
 pub use config::{Config, RunnerSpec, DEFAULT_CONFIG_FILES};
 pub use engine::{Engine, EngineResult};
 pub use executor::{Executor, OutputSink, StepOutcome, StepRequest};
+pub use layout::WorkDir;
 pub use logging::*;
 pub use matrix::{expand as expand_matrix, MatrixCombination};
 pub use parser::{SearchPath, WorkflowParser};

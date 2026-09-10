@@ -1,0 +1,10 @@
+{
+  "name": "minact-real-project",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A small project with the kind of CI workflow real repositories have",
+  "scripts": {
+    "test": "node --test test/",
+    "build": "node build.js"
+  }
+}
